@@ -1,0 +1,12 @@
+[submodule "libasdf"]
+	path = libasdf
+	url = https://github.com/asdf-format/libasdf.git
+[submodule "libfyaml"]
+	path = libfyaml
+	url = https://github.com/pantoniou/libfyaml.git
+[submodule "libmd"]
+	path = libmd
+	url = https://github.com/guillemj/libmd.git
+[submodule "googletest"]
+	path = googletest
+	url = https://github.com/google/googletest.git

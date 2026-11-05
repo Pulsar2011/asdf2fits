@@ -1,0 +1,31 @@
+Fix an endless loop when the YAML document end marker lies at the end of the read buffer.
+
+parse_tree_fast() looks at what is buffered after the "\n..." token. When the
+newline that follows the marker isn't buffered yet, the check fails and the
+loop scans again from the same position, finding the same token forever. A
+marker followed by anything but a newline loops the same way.
+
+Ask the stream for the whole line, and step over a token that isn't a marker.
+
+--- a/src/parser.c
++++ b/src/parser.c
+@@ -308,7 +308,8 @@ static int parse_tree_fast(asdf_parser_t *parser) {
+         // We got a match for either a document end marker or a block magic
+         switch (match_token) {
+         case ASDF_YAML_DOCUMENT_END_TOK: {
+-            buf = asdf_stream_next(parser->stream, 0, &len);
++            // Marker and line ending ("\r\n" at most): they may straddle the end of the buffer
++            buf = asdf_stream_next(parser->stream, ASDF_YAML_DOCUMENT_END_MARKER_SIZE + 2, &len);
+ 
+             if (LIKELY(is_yaml_document_end_marker((const char *)buf, len))) {
+                 // Read and consume the full line then set the tree end
+@@ -322,7 +323,8 @@ static int parse_tree_fast(asdf_parser_t *parser) {
+             }
+ 
+             // Looked like a document end marker but unexpected trailing bytes
+-            // instead of a newline; keep parsing
++            // instead of a newline; step over it and keep parsing
++            CONSUME_AND_CHECK_INT(parser, 1);
+             continue;
+         }
+         case ASDF_BLOCK_MAGIC_TOK:

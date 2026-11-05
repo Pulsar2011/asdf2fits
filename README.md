@@ -1,93 +1,111 @@
 # asdf2fits
 
+Load [ASDF](https://www.asdf-format.org/) files as [DeepSkyFits](https://gitlab.in2p3.fr/deepskyproject/deepskyfits)
+objects, and save those objects back to ASDF. Built on the
+[libasdf](https://github.com/asdf-format/libasdf) C library.
 
+```c++
+#include <asdf2fits/ASDFmanager.h>
+#include <asdf2fits/fits2asdf.h>
+using namespace DSL;
 
-## Getting started
+ASDFmanager file("observation.asdf");
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+// Metadata only: no pixel or table data is read
+std::shared_ptr<FITShdu> header = file.GetHeader("SCI");
+double exptime = header->GetDoubleValueForKey("EXPTIME");
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+// Data, by name or by index (the first HDU is 1, as in FITSmanager)
+std::shared_ptr<FITScube>  image = file.GetImage("SCI");
+std::shared_ptr<FITStable> table = file.GetTable("CATALOG");
+auto typed = std::dynamic_pointer_cast<FITSimg<float>>(image);  // FITSimg<T>, like any FITScube
 
-## Add your files
+image->Write("sci.fits");                                       // the DeepSkyFits API applies as usual
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+// Saving
+fits2asdf(*image, "image.asdf");                                // as the primary HDU
+fits2asdf(*table, "table.asdf", /*replace=*/true);              // after an empty primary HDU
 
+FITSmanager fits("observation.fits");
+fits2asdf(fits, "observation.asdf");                            // every HDU of a FITS file
 ```
-cd existing_repo
-git remote add origin https://gitlab.in2p3.fr/deepskyproject/asdf2fits.git
-git branch -M main
-git push -uf origin main
+
+Failures throw `FITSexception`.
+
+## What is read
+
+| In the ASDF file | Becomes |
+|---|---|
+| Value tagged `.../fits/fits-*` (astropy FITS layout) | One HDU per list entry, with its exact header |
+| ndarray of a numeric type | `FITSimg<T>` (`float16` as `float`, `bool8` as `uint8_t`) |
+| Structured ndarray, or value tagged `.../table-*` | `FITStable` |
+| Scalars next to an ndarray | Keywords of its HDU, nested keys as `META.INSTRUMENT.NAME` |
+| Scalars at the root of the tree | Keywords of the primary HDU |
+
+- Without the FITS layout, an HDU is named after its tree path. The one called `PRIMARY`, or else the first found,
+  is the primary HDU.
+- Axes are reversed to follow FITS: an array of shape `[ny, nx]` has `NAXIS1 = nx`.
+- Values are physical, so `BSCALE`/`BZERO` found in a header are not applied.
+- NaN (real images) and the `BLANK` value (integer images) mark masked pixels.
+- The FITS WCS is loaded from the header keywords.
+
+Not converted:
+
+- GWCS objects (Roman, JWST): such files load without a WCS.
+- Table columns that aren't plain ndarrays (`Time`, `Quantity`, `SkyCoord`) are left out.
+- Complex and string images, and ndarray `mask` properties, which libasdf doesn't read.
+- Strided tables, which throw.
+
+## What is written
+
+`fits2asdf` uses the layout of [asdf-astropy](https://github.com/astropy/asdf-astropy)
+(`tag:astropy.org:astropy/fits/fits-1.2.0`): a list of HDUs with `header` as `[key, value, comment]` cards, and
+`data` as an ndarray. Tables are structured ndarrays, which that schema allows. In Python:
+
+```python
+import asdf
+with asdf.open("observation.asdf") as f:
+    hdul = f["fits"]    # astropy.io.fits.HDUList
 ```
 
-## Integrate with your tools
+- Data are written as physical values, so `TSCALn`/`TZEROn` are not carried over.
+- Masked pixels become NaN, or a `BLANK` value for integers (the lowest value of a signed type, the highest of an
+  unsigned one).
+- Variable-length columns (`P`/`Q`) have no ASDF form and throw.
 
-* [Set up project integrations](https://gitlab.in2p3.fr/deepskyproject/asdf2fits/-/settings/integrations)
+Two limits of astropy's `BinTableHDU` affect tables opened through astropy; plain `asdf` and this library read them
+correctly:
 
-## Collaborate with your team
+- `int8` columns are read as booleans.
+- `TUNITn` is ignored, so column units don't show up in `hdul[i].columns`.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## Build
 
-## Test and Deploy
+Requires CMake 3.21 or newer, a C++20 compiler, autoconf, automake, libtool, pkg-config, lz4, zlib and bzip2.
+On macOS: `brew install cmake autoconf automake libtool pkgconf lz4`.
+DeepSkyFits (`DSTfits` 1.5 or newer) must already be installed in `$DeepSkyROOT` (by default, the parent directory).
 
-Use the built-in continuous integration in GitLab.
+```sh
+git clone --recurse-submodules https://gitlab.in2p3.fr/deepskyproject/asdf2fits.git
+cd asdf2fits
+cmake -S . -B build
+cmake --build build -j
+(cd build && ctest)
+cmake --install build      # to $DeepSkyROOT unless CMAKE_INSTALL_PREFIX is set
+```
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+libasdf and its dependencies libfyaml and libmd are built from the submodules. libasdf is built from a copy with [a fix for an endless loop](cmake/patches/libasdf-document-end-marker.patch) applied, until upstream has it; the submodule itself stays unmodified. libfyaml and libmd are linked into
+`libasdf`, so `libasdf2fits`, `libasdf` and their headers are all that gets installed. `-DWITH_ASAN=ON` builds with
+AddressSanitizer.
 
-***
+To use the library from CMake:
 
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+```cmake
+find_package(DSTfits 1.5 REQUIRED)
+find_package(asdf2fits REQUIRED)
+target_link_libraries(myapp asdf2fits::asdf2fits DSTfits::DSTfits)
+```
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+PolyForm Noncommercial 1.0.0, as DeepSkyFits. libasdf, libfyaml and libmd keep their own licences.

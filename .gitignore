@@ -1,0 +1,39 @@
+# Paths starting with "/" only match at the root: an unanchored gTest_* would also ignore
+# test/gTest_asdf2fits.cxx.
+
+#--------------- Out-of-source build
+/build/
+
+#--------------- In-source build (cmake .)
+/CMakeCache.txt
+/CMakeFiles/
+/CTestTestfile.cmake
+/Makefile
+/Testing/
+/cmake_install.cmake
+/install_manifest.txt
+/compile_commands.json
+/external/
+/generated/
+/stage/
+/bin/
+/lib/
+/gTest_*
+
+# Package files generated here by an older CMakeLists.txt (they now go to generated/)
+/cmake/asdf2fitsConfig.cmake
+/cmake/asdf2fitsConfigVersion.cmake
+
+#--------------- Products
+*.dylib
+*.so
+*.so.*
+*.a
+*.o
+
+#--------------- Data files
+*.asdf
+*.fits
+
+#--------------- System
+.DS_Store
