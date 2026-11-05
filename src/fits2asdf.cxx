@@ -8,6 +8,10 @@
 //  SPDX-License-Identifier: BSD-3-Clause
 //  Licence text: see the LICENSE file at the root of this project.
 
+/**
+ * @file fits2asdf.cxx
+ * @brief Implementation of fits2asdf(): an extension of libasdf serializing a list of HDUs.
+ */
 #include "fits2asdf.h"
 
 #include <exception>
@@ -26,26 +30,35 @@ namespace DSL
 
     namespace
     {
-        const char* const kWho = "fits2asdf";
+        const char* const kWho = "fits2asdf";   //!< Name given in the exceptions thrown here
 
+        /** @brief One HDU to write. With neither image nor table, only its header is written. */
         struct HDUOut
         {
-            const FITScube*  cube  = nullptr;
-            const FITStable* table = nullptr;
-            FITShdu header;
+            const FITScube*  cube  = nullptr;   //!< Image to write, not owned; may be null
+            const FITStable* table = nullptr;   //!< Table to write, not owned; may be null
+            FITShdu header;                     //!< Copy of the header, adjusted while writing
         };
 
-        // What the extension serializes. Exceptions can't cross the C frames of libasdf: they are
-        // kept here and thrown again once back in C++.
+        /**
+         * @brief What the extension serializes.
+         * @details Exceptions can't cross the C frames of libasdf: they are kept here and thrown
+         * again once back in C++.
+         */
         struct HDUList
         {
-            std::vector<HDUOut> hdus;
-            std::exception_ptr failure;
+            std::vector<HDUOut> hdus;       //!< HDUs in file order; the first is the primary HDU
+            std::exception_ptr failure;     //!< Exception caught while serializing, if any
         };
 
+        /** @brief Structural keywords, written first in this order as in a FITS header. */
         const std::vector<std::string> kFirstCards = {"SIMPLE", "XTENSION", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "NAXIS3", "NAXIS4",
                                                       "EXTEND", "PCOUNT", "GCOUNT", "TFIELDS"};
 
+        /**
+         * @brief Remove the keywords that are set again on writing or no longer hold.
+         * @param header Header to update: SIMPLE, XTENSION, EXTEND, PCOUNT, GCOUNT, CHECKSUM and DATASUM go.
+         */
         void dropStaleKeywords(FITShdu& header)
         {
             for(const char* key : {"SIMPLE", "XTENSION", "EXTEND", "PCOUNT", "GCOUNT", "CHECKSUM", "DATASUM"})
@@ -53,6 +66,14 @@ namespace DSL
                     header.DeleteKey(key);
         }
 
+        /**
+         * @brief Turn one HDU into a {header, data} mapping.
+         * @param file    File the mapping is created in.
+         * @param hdu     HDU to write; its header is adjusted to match what is written.
+         * @param primary True for the primary HDU.
+         * @return The new mapping; it has no @c data entry if the HDU holds no data.
+         * @throws FITSexception As writeImage() or writeTable().
+         */
         asdf_value_t* serializeHDU(asdf_file_t* file, HDUOut& hdu, bool primary)
         {
             asdf_mapping_t* node = asdf_mapping_create(file);
@@ -89,6 +110,12 @@ namespace DSL
             return asdf_value_of_mapping(node);
         }
 
+        /**
+         * @brief Serialize callback of the extension: turn the HDU list into a sequence.
+         * @param file   File the sequence is created in.
+         * @param object The HDUList to write. On an exception, its @c failure member keeps it.
+         * @return The new sequence, or null if an exception was caught.
+         */
         asdf_value_t* serializeList(asdf_file_t* file, const void* object, const void*)
         {
             auto* list = const_cast<HDUList*>(static_cast<const HDUList*>(object));
@@ -106,6 +133,10 @@ namespace DSL
             }
         }
 
+        /**
+         * @brief Get the libasdf extension for the astropy FITS tag, registering it on first use.
+         * @return The extension, valid until the end of the program.
+         */
         asdf_extension_t* fitsExtension()
         {
             static const char* const tags[] = {"tag:astropy.org:astropy/fits/fits-1.2.0", nullptr};
@@ -123,6 +154,14 @@ namespace DSL
             return &extension;
         }
 
+        /**
+         * @brief Serialize an HDU list and write the file.
+         * @param list    HDUs to write.
+         * @param path    File to create.
+         * @param replace Overwrite an existing file.
+         * @throws FITSexception FILE_NOT_CREATED if the file exists and @p replace is false, or if it can't
+         * be created or written. WRITE_ERROR if serializing fails, or the exception caught while serializing.
+         */
         void writeFile(HDUList& list, const std::string& path, bool replace)
         {
             if(!replace && std::filesystem::exists(path))
@@ -142,6 +181,11 @@ namespace DSL
                 throw FITSexception(FILE_NOT_CREATED, kWho, "write", "can't write "+path+": "+lastError(file.get()));
         }
 
+        /**
+         * @brief Describe an image to write.
+         * @param cube Image, which must outlive the result.
+         * @return The HDU, with a copy of the image's header.
+         */
         HDUOut cubeHDU(const FITScube& cube)
         {
             HDUOut out;
@@ -150,6 +194,11 @@ namespace DSL
             return out;
         }
 
+        /**
+         * @brief Describe a table to write.
+         * @param table Table, which must outlive the result.
+         * @return The HDU, with a copy of the table's header.
+         */
         HDUOut tableHDU(const FITStable& table)
         {
             HDUOut out;

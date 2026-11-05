@@ -8,6 +8,10 @@
 //  SPDX-License-Identifier: BSD-3-Clause
 //  Licence text: see the LICENSE file at the root of this project.
 
+/**
+ * @file ASDFheader.cxx
+ * @brief Implementation of the conversion between the ASDF tree and FITShdu keywords.
+ */
 #include "ASDFheader.h"
 
 #include <algorithm>
@@ -20,12 +24,22 @@ namespace DSL::asdfdetail
 {
     namespace
     {
+        /**
+         * @brief Put a text in upper case, to name keywords.
+         * @param text Text to convert.
+         * @return The converted text.
+         */
         std::string upper(std::string text)
         {
             std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c){ return std::toupper(c); });
             return text;
         }
 
+        /**
+         * @brief Remove the spaces and tabs around a text.
+         * @param text Text to trim.
+         * @return The trimmed text; empty if nothing else is left.
+         */
         std::string trim(const std::string& text)
         {
             const size_t first = text.find_first_not_of(" \t");
@@ -34,12 +48,27 @@ namespace DSL::asdfdetail
             return text.substr(first, text.find_last_not_of(" \t") - first + 1);
         }
 
+        /**
+         * @brief Add text to the single entry FITShdu keeps for a commentary keyword.
+         * @param hdu  Header to update.
+         * @param key  COMMENT or HISTORY.
+         * @param text Text to add, after a space if the entry already exists.
+         */
         void appendCommentary(FITShdu& hdu, const std::string& key, const std::string& text)
         {
             std::string all = hdu.Exists(key) ? hdu.GetEntry(key)->second.value() + " " + text : text;
             hdu.ValueForKey(key, all, fChar);
         }
 
+        /**
+         * @brief Set a keyword with the type of a scalar value.
+         * @details Selects on the exact type of the value. A null value sets nothing. Other scalars that have no
+         * keyword type, as well as infinities and NaN, are kept as text.
+         * @param value   Scalar value.
+         * @param key     Name of the keyword.
+         * @param comment Comment of the keyword.
+         * @param hdu     Header receiving the keyword.
+         */
         void setScalar(asdf_value_t* value, const std::string& key, const std::string& comment, FITShdu& hdu)
         {
             bool     flag = false;
@@ -271,6 +300,15 @@ namespace DSL::asdfdetail
 
     namespace
     {
+        /**
+         * @brief Append one [key, value, comment] card, with the value in its keyword type.
+         * @details A value that doesn't parse as its declared type is written as text.
+         * @param file    File the card is created in.
+         * @param cards   List receiving the card.
+         * @param key     Name of the keyword.
+         * @param keyword Keyword to write; the comment is left out if it is blank.
+         * @param hdu     Header holding the keyword, used to convert its value.
+         */
         void appendCard(asdf_file_t* file, asdf_sequence_t* cards, const std::string& key, const FITSkeyword& keyword, const FITShdu& hdu)
         {
             asdf_sequence_t* card = asdf_sequence_create(file);
@@ -316,6 +354,13 @@ namespace DSL::asdfdetail
             asdf_sequence_append_sequence(cards, card);
         }
 
+        /**
+         * @brief Append a commentary keyword as cards of 72 characters of text.
+         * @param file  File the cards are created in.
+         * @param cards List receiving the cards.
+         * @param key   COMMENT or HISTORY.
+         * @param text  Whole text of the keyword.
+         */
         void appendCommentary(asdf_file_t* file, asdf_sequence_t* cards, const std::string& key, const std::string& text)
         {
             // One card holds 72 characters of text

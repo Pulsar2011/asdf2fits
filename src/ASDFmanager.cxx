@@ -8,6 +8,10 @@
 //  SPDX-License-Identifier: BSD-3-Clause
 //  Licence text: see the LICENSE file at the root of this project.
 
+/**
+ * @file ASDFmanager.cxx
+ * @brief Implementation of DSL::ASDFmanager: discovery of the HDUs of an ASDF tree.
+ */
 #include "ASDFmanager.h"
 
 #include <algorithm>
@@ -26,32 +30,53 @@ namespace DSL
 
     namespace
     {
-        const char* const kWho = "ASDFmanager";
+        const char* const kWho = "ASDFmanager"; //!< Name given in the exceptions thrown here
 
+        /**
+         * @brief Put a text in lower case, to compare HDU names.
+         * @param text Text to convert.
+         * @return The converted text.
+         */
         std::string lower(std::string text)
         {
             std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c){ return std::tolower(c); });
             return text;
         }
 
+        /** @brief What the manager knows about one HDU; the data stay in the file until requested. */
         struct HDUEntry
         {
-            enum Kind { empty, image, table } kind = empty;
-            std::string name;
-            FITShdu header;
+            /** @brief What an HDU holds. */
+            enum Kind
+            {
+                empty,  //!< Only a header
+                image,  //!< A numeric ndarray
+                table   //!< A structured ndarray or a table value
+            } kind = empty;                     //!< What this HDU holds
+            std::string name;                   //!< EXTNAME or tree path, used to find the HDU
+            FITShdu header;                     //!< Keywords of the HDU
             NdarrayPtr ndarray;                 //!< Image pixels, or the rows of a structured table
             std::vector<NdarrayPtr> arrays;     //!< One per column of a column-based table
-            std::vector<ColumnSpec> columns;
-            uint64_t rows = 0;
-            bool structured = false;
+            std::vector<ColumnSpec> columns;    //!< Layout of a table's columns
+            uint64_t rows = 0;                  //!< Number of rows of a table
+            bool structured = false;            //!< The table's columns all live in @c ndarray
         };
 
+        /**
+         * @brief Tell whether a value is tagged as a table.
+         * @param value Value of the ASDF tree.
+         * @return True for a .../table/table-* or .../core/table-* tag.
+         */
         bool isTableValue(asdf_value_t* value)
         {
             return hasTag(value, "table/table-") || hasTag(value, "core/table-");
         }
 
-        // True when the value holds, at any depth, something that becomes an HDU
+        /**
+         * @brief Tell whether a value holds, at any depth, something that becomes an HDU.
+         * @param value Value of the ASDF tree.
+         * @return True if it is or contains data outside any GWCS object or transform.
+         */
         bool holdsData(asdf_value_t* value)
         {
             if(isOpaqueValue(value))
@@ -71,6 +96,15 @@ namespace DSL
             return false;
         }
 
+        /**
+         * @brief Fill an HDU from its data, reading only metadata.
+         * @details A table value or a structured ndarray makes a table. Any other ndarray with dimensions and
+         * elements makes an image, whose type is only checked on loading; otherwise the HDU stays empty.
+         * @param value Table or ndarray value.
+         * @param entry HDU to fill; its header receives the structure keywords.
+         * @throws FITSexception BAD_DIMEN if the columns of a table have different lengths, BAD_DATATYPE if the
+         * ndarray can't be read, NOT_TABLE or BAD_TFORM if the table can't be described.
+         */
         void describeData(asdf_value_t* value, HDUEntry& entry)
         {
             if(isTableValue(value))
@@ -115,15 +149,22 @@ namespace DSL
         }
     }
 
+    /** @brief Private state of DSL::ASDFmanager: the open file and its list of HDUs. */
     struct ASDFmanager::Impl
     {
-        mutable std::mutex mtx;
-        FilePtr file;
-        std::string path;
-        std::vector<HDUEntry> hdus;
-        bool fitsLayout = false;
-        FITShdu rootKeywords;
+        mutable std::mutex mtx;         //!< Taken by every public method
+        FilePtr file;                   //!< The open file; null once closed
+        std::string path;               //!< Path of the file, for messages
+        std::vector<HDUEntry> hdus;     //!< All HDUs, the primary one first
+        bool fitsLayout = false;        //!< The file holds the astropy FITS layout
+        FITShdu rootKeywords;           //!< Keywords from the scalars at the root of the tree
 
+        /**
+         * @brief Add every HDU of a value in the astropy FITS layout.
+         * @details An HDU is named after EXTNAME, otherwise PRIMARY for the first and HDUn for the others.
+         * @param value Sequence of {header, data} mappings; a non-sequence or non-mapping entry is skipped.
+         * @throws FITSexception As describeData().
+         */
         void addFitsLayout(asdf_value_t* value)
         {
             fitsLayout = true;
@@ -156,6 +197,13 @@ namespace DSL
             }
         }
 
+        /**
+         * @brief Add one HDU for a table or an ndarray found in a tree of another layout.
+         * @param value    Data of the HDU.
+         * @param path     Tree path, used as the name of the HDU and, unless it is PRIMARY, as EXTNAME.
+         * @param siblings Mapping containing the data, whose scalars become keywords; may be null.
+         * @throws FITSexception As describeData().
+         */
         void addData(asdf_value_t* value, const std::string& path, asdf_value_t* siblings)
         {
             HDUEntry entry;
@@ -168,6 +216,14 @@ namespace DSL
             hdus.push_back(std::move(entry));
         }
 
+        /**
+         * @brief Find the HDUs below a value, recursively.
+         * @details GWCS objects and transforms are skipped, as are asdf_library and history at the root.
+         * @param value    Value to search.
+         * @param path     Tree path of the value, its parts joined by dots; empty at the root.
+         * @param siblings Mapping containing @p value, whose scalars become keywords if @p value is data; null at the root and for its direct entries.
+         * @throws FITSexception As describeData().
+         */
         void walk(asdf_value_t* value, const std::string& path, asdf_value_t* siblings)
         {
             if(isOpaqueValue(value))
@@ -206,6 +262,11 @@ namespace DSL
             }
         }
 
+        /**
+         * @brief Turn the root of the tree into keywords, in @c rootKeywords.
+         * @details Entries holding data, GWCS objects, transforms, asdf_library and history are skipped.
+         * @param root Root of the tree; ignored if it isn't a mapping.
+         */
         void collectRootKeywords(asdf_value_t* root)
         {
             asdf_mapping_t* mapping = nullptr;
@@ -228,6 +289,12 @@ namespace DSL
             }
         }
 
+        /**
+         * @brief List the HDUs of the file and put the primary one first.
+         * @details Except in the astropy FITS layout, a tree without data gets an empty PRIMARY HDU and the
+         * root keywords go to the first HDU.
+         * @throws FITSexception FILE_NOT_OPENED if the file has no tree, or as describeData().
+         */
         void discover()
         {
             ValuePtr root(asdf_get_value(file.get(), ""));
@@ -257,12 +324,24 @@ namespace DSL
             hdus.front().header.Import(rootKeywords);
         }
 
+        /**
+         * @brief Check that the file is open.
+         * @param what Name of the calling method, for the message.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed.
+         */
         void requireOpen(const char* what) const
         {
             if(!file)
                 throw FITSexception(FILE_NOT_OPENED, kWho, what, "the file is closed");
         }
 
+        /**
+         * @brief Find an HDU from its index.
+         * @param index Index of the HDU, starting at 1.
+         * @param what  Name of the calling method, for the message.
+         * @return The HDU.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed, BAD_HDU_NUM if there is no such HDU.
+         */
         HDUEntry& at(int index, const char* what)
         {
             requireOpen(what);
@@ -271,6 +350,13 @@ namespace DSL
             return hdus[static_cast<size_t>(index - 1)];
         }
 
+        /**
+         * @brief Find the first HDU of a name.
+         * @param name Name of the HDU, matched without regard to case.
+         * @param what Name of the calling method, for the message.
+         * @return The HDU.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed, BAD_HDU_NUM if there is no such HDU.
+         */
         HDUEntry& named(const std::string& name, const char* what)
         {
             requireOpen(what);
@@ -280,6 +366,12 @@ namespace DSL
             return *it;
         }
 
+        /**
+         * @brief Read the image of an HDU.
+         * @param entry HDU to read.
+         * @return The image.
+         * @throws FITSexception NOT_IMAGE if the HDU is a table or empty, or as readImage().
+         */
         std::shared_ptr<FITScube> loadImage(HDUEntry& entry)
         {
             if(entry.kind == HDUEntry::table)
@@ -289,6 +381,12 @@ namespace DSL
             return readImage(entry.ndarray.get(), entry.header);
         }
 
+        /**
+         * @brief Read the table of an HDU.
+         * @param entry HDU to read.
+         * @return The table.
+         * @throws FITSexception NOT_TABLE if the HDU isn't a table, or as readTable().
+         */
         std::shared_ptr<FITStable> loadTable(HDUEntry& entry)
         {
             if(entry.kind != HDUEntry::table)

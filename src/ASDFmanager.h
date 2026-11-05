@@ -8,6 +8,10 @@
 //  SPDX-License-Identifier: BSD-3-Clause
 //  Licence text: see the LICENSE file at the root of this project.
 
+/**
+ * @file ASDFmanager.h
+ * @brief Reading of ASDF files as DeepSkyFits objects.
+ */
 #ifndef _DSL_ASDFmanager_
 #define _DSL_ASDFmanager_
 
@@ -37,34 +41,115 @@ namespace DSL
      *
      * Values in an ASDF file are physical: BSCALE and BZERO found in a header are not applied.
      * NaN (real images) or the BLANK value (integer images) mark masked pixels.
+     *
+     * Each public call locks a mutex of the instance. Objects handed out are independent copies:
+     * changing them doesn't affect the manager, and they outlive it.
      */
     class ASDFmanager
     {
     public:
-        explicit ASDFmanager(const std::string& path);      //!< Open an existing ASDF file
+        /**
+         * @brief Open an existing ASDF file and list its HDUs.
+         * @param path File to open.
+         * @throws FITSexception FILE_NOT_OPENED if the file can't be opened or has no tree. BAD_DATATYPE,
+         * BAD_DIMEN, BAD_TFORM or NOT_TABLE if the description of an HDU can't be read.
+         */
+        explicit ASDFmanager(const std::string& path);
+
+        /** @brief Close the file. */
         ~ASDFmanager();
 
-        ASDFmanager(const ASDFmanager&) = delete;
-        ASDFmanager& operator=(const ASDFmanager&) = delete;
+        ASDFmanager(const ASDFmanager&) = delete;               //!< Not copyable: the manager owns the file
+        ASDFmanager& operator=(const ASDFmanager&) = delete;    //!< Not copyable: the manager owns the file
 
-        int NumberOfHeader() const;                         //!< Total number of HDU
+        /**
+         * @brief Get the number of HDUs.
+         * @return The total number of HDUs, 0 once the file is closed.
+         */
+        int NumberOfHeader() const;
+
+        /**
+         * @brief Tell whether the file is open.
+         * @return False once Close() has been called.
+         */
         bool isOpen() const;
-        void Close();                                       //!< Objects already handed out stay valid
 
+        /**
+         * @brief Close the file and forget its HDUs. Objects already handed out stay valid.
+         * @details Calling it again has no effect. Afterwards, any call to get an HDU throws FITSexception.
+         */
+        void Close();
+
+        /**
+         * @brief Get a copy of the header of the primary HDU.
+         * @return The header of HDU 1.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed.
+         */
         std::shared_ptr<FITShdu>   GetPrimaryHeader();
-        std::shared_ptr<FITShdu>   GetHeaderAtIndex(const int&);
-        std::shared_ptr<FITShdu>   GetHeader(const std::string&);
 
+        /**
+         * @brief Get a copy of the header of an HDU.
+         * @param index Index of the HDU, starting at 1.
+         * @return The header.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed, BAD_HDU_NUM if there is no such HDU.
+         */
+        std::shared_ptr<FITShdu>   GetHeaderAtIndex(const int& index);
+
+        /**
+         * @brief Get a copy of the header of an HDU.
+         * @param name Name of the HDU, matched without regard to case.
+         * @return The header.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed, BAD_HDU_NUM if there is no such HDU.
+         */
+        std::shared_ptr<FITShdu>   GetHeader(const std::string& name);
+
+        /**
+         * @brief Read the image of the primary HDU.
+         * @return The image of HDU 1.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed, NOT_IMAGE if HDU 1 is a table or
+         * holds no data, BAD_DATATYPE or READ_ERROR if the pixels can't be loaded.
+         */
         std::shared_ptr<FITScube>  GetPrimary();
-        std::shared_ptr<FITScube>  GetImageAtIndex(const int&);
-        std::shared_ptr<FITScube>  GetImage(const std::string&);
 
-        std::shared_ptr<FITStable> GetTableAtIndex(const int&);
-        std::shared_ptr<FITStable> GetTable(const std::string&);
+        /**
+         * @brief Read the image of an HDU.
+         * @param index Index of the HDU, starting at 1.
+         * @return The image.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed, BAD_HDU_NUM if there is no such HDU,
+         * NOT_IMAGE if it is a table or holds no data, BAD_DATATYPE or READ_ERROR if the pixels can't be loaded.
+         */
+        std::shared_ptr<FITScube>  GetImageAtIndex(const int& index);
+
+        /**
+         * @brief Read the image of an HDU.
+         * @param name Name of the HDU, matched without regard to case.
+         * @return The image.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed, BAD_HDU_NUM if there is no such HDU,
+         * NOT_IMAGE if it is a table or holds no data, BAD_DATATYPE or READ_ERROR if the pixels can't be loaded.
+         */
+        std::shared_ptr<FITScube>  GetImage(const std::string& name);
+
+        /**
+         * @brief Read the table of an HDU.
+         * @param index Index of the HDU, starting at 1.
+         * @return The table.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed, BAD_HDU_NUM if there is no such HDU,
+         * NOT_TABLE if it isn't a table, BAD_DIMEN, BAD_TFORM or READ_ERROR if its columns can't be loaded.
+         */
+        std::shared_ptr<FITStable> GetTableAtIndex(const int& index);
+
+        /**
+         * @brief Read the table of an HDU.
+         * @param name Name of the HDU, matched without regard to case.
+         * @return The table.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed, BAD_HDU_NUM if there is no such HDU,
+         * NOT_TABLE if it isn't a table, BAD_DIMEN, BAD_TFORM or READ_ERROR if its columns can't be loaded.
+         */
+        std::shared_ptr<FITStable> GetTable(const std::string& name);
 
     private:
-        struct Impl;
-        std::unique_ptr<Impl> impl;
+        struct Impl;                //!< Open file and list of HDUs
+        std::unique_ptr<Impl> impl; //!< Private state of the manager
     };
 }
 

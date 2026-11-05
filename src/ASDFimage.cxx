@@ -8,6 +8,10 @@
 //  SPDX-License-Identifier: BSD-3-Clause
 //  Licence text: see the LICENSE file at the root of this project.
 
+/**
+ * @file ASDFimage.cxx
+ * @brief Implementation of the conversion between ndarrays and FITSimg\<T\>.
+ */
 #include "ASDFimage.h"
 
 #include <bit>
@@ -23,8 +27,13 @@ namespace DSL::asdfdetail
 {
     namespace
     {
-        const char* const kWho = "asdf2fits";
+        const char* const kWho = "asdf2fits";   //!< Name given in the exceptions thrown here
 
+        /**
+         * @brief Get the ndarray element type of a pixel type.
+         * @tparam T Pixel type: any integer type, float or double.
+         * @return The matching libasdf type.
+         */
         template<typename T> asdf_scalar_datatype_t scalarType()
         {
             if constexpr (std::is_same_v<T, int8_t>)   return ASDF_DATATYPE_INT8;
@@ -39,6 +48,16 @@ namespace DSL::asdfdetail
             if constexpr (std::is_same_v<T, double>)   return ASDF_DATATYPE_FLOAT64;
         }
 
+        /**
+         * @brief Load an ndarray into a new image of pixel type @p T.
+         * @details Masks the pixels that are NaN, or equal to BLANK in an integer image, and loads the WCS if
+         * the header describes one.
+         * @tparam T Pixel type of the image; the data are converted to it.
+         * @param ndarray Ndarray giving the pixels and the shape.
+         * @param header  Header giving the keywords of the image.
+         * @return The new image.
+         * @throws FITSexception READ_ERROR if reading the array fails.
+         */
         template<typename T>
         std::shared_ptr<FITScube> load(asdf_ndarray_t* ndarray, const FITShdu& header)
         {
@@ -86,6 +105,17 @@ namespace DSL::asdfdetail
             return image;
         }
 
+        /**
+         * @brief Copy a cube into a new ndarray value if its pixels are of type @p T.
+         * @details Masked pixels take NaN or, in integer images, the value stored as BLANK.
+         * @tparam T Pixel type to try.
+         * @param file   File the value is created in.
+         * @param cube   Cube to copy.
+         * @param header Header of the output HDU; receives the structure keywords and BLANK if needed.
+         * @param out    Receives the new value.
+         * @return False if the cube holds another type, and nothing was done.
+         * @throws FITSexception MEMORY_ALLOCATION if the buffer can't be allocated, WRITE_ERROR if the value can't be created.
+         */
         template<typename T>
         bool store(asdf_file_t* file, const FITScube& cube, FITShdu& header, asdf_value_t*& out)
         {

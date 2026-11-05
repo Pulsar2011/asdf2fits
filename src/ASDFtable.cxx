@@ -8,6 +8,10 @@
 //  SPDX-License-Identifier: BSD-3-Clause
 //  Licence text: see the LICENSE file at the root of this project.
 
+/**
+ * @file ASDFtable.cxx
+ * @brief Implementation of the conversion between ASDF tables and FITStable.
+ */
 #include "ASDFtable.h"
 
 #include <algorithm>
@@ -25,20 +29,36 @@ namespace DSL::asdfdetail
 {
     namespace
     {
-        const char* const kWho = "asdf2fits";
+        const char* const kWho = "asdf2fits";   //!< Name given in the exceptions thrown here
 
+        /** @brief Byte order of this machine. */
         const asdf_byteorder_t kHostOrder = (std::endian::native == std::endian::little) ? ASDF_BYTEORDER_LITTLE : ASDF_BYTEORDER_BIG;
 
+        /**
+         * @brief Reverse bytes in place, to change the byte order of a value.
+         * @param data First byte of the value.
+         * @param size Size of the value in bytes.
+         */
         void reverseBytes(void* data, size_t size)
         {
             auto* bytes = static_cast<unsigned char*>(data);
             std::reverse(bytes, bytes + size);
         }
 
-        // One stored element converted to its in-memory form
+        /**
+         * @brief One stored element converted to its in-memory form.
+         * @tparam T Type of the element in memory.
+         */
         template<typename T> struct Element
         {
-            static constexpr size_t bytes = sizeof(T);
+            static constexpr size_t bytes = sizeof(T);  //!< Size of a stored element
+
+            /**
+             * @brief Read one element.
+             * @param p    First byte of the element, without any alignment requirement.
+             * @param swap The element is stored in the other byte order than this machine.
+             * @return The element.
+             */
             static T read(const uint8_t* p, bool swap)
             {
                 T value;
@@ -49,21 +69,44 @@ namespace DSL::asdfdetail
             }
         };
 
+        /** @brief A boolean, stored in one byte. */
         template<> struct Element<bool>
         {
-            static constexpr size_t bytes = 1;
+            static constexpr size_t bytes = 1;  //!< Size of a stored element
+
+            /**
+             * @brief Read one element.
+             * @param p First byte of the element.
+             * @return True if the byte isn't zero.
+             */
             static bool read(const uint8_t* p, bool) { return *p != 0; }
         };
 
+        /**
+         * @brief A complex number, stored as its real part followed by its imaginary part.
+         * @tparam R Type of each part.
+         */
         template<typename R> struct Element<std::pair<R, R>>
         {
-            static constexpr size_t bytes = 2 * sizeof(R);
+            static constexpr size_t bytes = 2 * sizeof(R);  //!< Size of a stored element
+
+            /**
+             * @brief Read one element.
+             * @param p    First byte of the element.
+             * @param swap The parts are stored in the other byte order than this machine.
+             * @return The real and imaginary parts.
+             */
             static std::pair<R, R> read(const uint8_t* p, bool swap)
             {
                 return { Element<R>::read(p, swap), Element<R>::read(p + sizeof(R), swap) };
             }
         };
 
+        /**
+         * @brief Append one character encoded in UTF-8.
+         * @param out Text to append to.
+         * @param c   Unicode code point.
+         */
         void appendUtf8(std::string& out, uint32_t c)
         {
             if(c < 0x80)
@@ -88,6 +131,12 @@ namespace DSL::asdfdetail
             }
         }
 
+        /**
+         * @brief Read a fixed-width string, without its trailing NUL padding.
+         * @param spec Layout of the column: ASCII or UCS-4, with its width and byte order.
+         * @param p    First byte of the string.
+         * @return The text; UCS-4 is converted to UTF-8.
+         */
         std::string readString(const ColumnSpec& spec, const uint8_t* p)
         {
             std::string text;
@@ -107,7 +156,13 @@ namespace DSL::asdfdetail
             return text;
         }
 
-        // Fills a column, skipping the per-row metadata update: only the first value goes through it
+        /**
+         * @brief Fill a column, skipping the per-row metadata update: only the first value goes through it.
+         * @tparam T Type of a cell.
+         * @param column Column to fill.
+         * @param values Value of each row.
+         * @return The filled column.
+         */
         template<typename T>
         std::shared_ptr<FITSform> finish(std::shared_ptr<FITScolumn<T>> column, std::vector<T>&& values)
         {
@@ -120,6 +175,17 @@ namespace DSL::asdfdetail
             return column;
         }
 
+        /**
+         * @brief Read a column of numbers, booleans or complex numbers.
+         * @tparam T Type of an element in memory.
+         * @param spec     Layout of the column.
+         * @param base     First byte of the column in the first row; unused without rows.
+         * @param rowBytes Distance between two rows.
+         * @param rows     Number of rows.
+         * @param type     FITS type of the column.
+         * @param position Position of the column in the table, starting at 1.
+         * @return The new column; its cells are vectors if there is more than one element per row.
+         */
         template<typename T>
         std::shared_ptr<FITSform> readNumeric(const ColumnSpec& spec, const uint8_t* base, uint64_t rowBytes, uint64_t rows, dtype type, size_t position)
         {
@@ -141,6 +207,15 @@ namespace DSL::asdfdetail
             return finish<std::vector<T>>(column, std::move(values));
         }
 
+        /**
+         * @brief Read a column of fixed-width strings.
+         * @param spec     Layout of the column.
+         * @param base     First byte of the column in the first row; unused without rows.
+         * @param rowBytes Distance between two rows.
+         * @param rows     Number of rows.
+         * @param position Position of the column in the table, starting at 1.
+         * @return The new column; its cells are vectors if there is more than one string per row.
+         */
         std::shared_ptr<FITSform> readStrings(const ColumnSpec& spec, const uint8_t* base, uint64_t rowBytes, uint64_t rows, size_t position)
         {
             const int64_t width = static_cast<int64_t>(spec.type == ASDF_DATATYPE_UCS4 ? spec.elemBytes / 4 : spec.elemBytes);
@@ -161,6 +236,16 @@ namespace DSL::asdfdetail
             return finish<std::vector<std::string>>(column, std::move(values));
         }
 
+        /**
+         * @brief Read a column according to its stored type.
+         * @param spec     Layout of the column.
+         * @param base     First byte of the column in the first row; unused without rows.
+         * @param rowBytes Distance between two rows.
+         * @param rows     Number of rows.
+         * @param position Position of the column in the table, starting at 1.
+         * @return The new column.
+         * @throws FITSexception BAD_TFORM if FITStable can't hold the type.
+         */
         std::shared_ptr<FITSform> readColumn(const ColumnSpec& spec, const uint8_t* base, uint64_t rowBytes, uint64_t rows, size_t position)
         {
             switch(spec.type)
@@ -185,6 +270,13 @@ namespace DSL::asdfdetail
             }
         }
 
+        /**
+         * @brief Check that an ndarray has no gaps between its elements.
+         * @param ndarray      Ndarray to check.
+         * @param elementBytes Expected distance between two elements of the last dimension.
+         * @param what         What the ndarray holds, for the message.
+         * @throws FITSexception BAD_DIMEN if the strides differ from a contiguous layout.
+         */
         void requireContiguous(const asdf_ndarray_t* ndarray, uint64_t elementBytes, const std::string& what)
         {
             if(!ndarray->strides)
@@ -199,7 +291,12 @@ namespace DSL::asdfdetail
             }
         }
 
-        // Size in bytes of one element of a scalar or string datatype of a field or column
+        /**
+         * @brief Get the size of one element of a field or column of scalars or strings.
+         * @param datatype Type of the field or column.
+         * @param count    Number of strings in the field, to split its total size; ignored for other types.
+         * @return The size in bytes; for a string, all its characters.
+         */
         uint64_t elementBytes(const asdf_datatype_t& datatype, uint64_t count)
         {
             if(datatype.type == ASDF_DATATYPE_ASCII || datatype.type == ASDF_DATATYPE_UCS4)
@@ -209,26 +306,55 @@ namespace DSL::asdfdetail
 
         // Writing --------------------------------------------------------------------------------
 
+        /** @brief One table column to write. */
         struct OutColumn
         {
-            const FITSform* form = nullptr;
-            ColumnSpec spec;
-            std::vector<uint64_t> fieldShape;
+            const FITSform* form = nullptr;     //!< Column to write, not owned
+            ColumnSpec spec;                    //!< Its layout in the output rows
+            std::vector<uint64_t> fieldShape;   //!< Storage for the shape in the output datatype
         };
 
+        /**
+         * @brief Store one element.
+         * @tparam T Type of the element.
+         * @param p     Destination, without any alignment requirement.
+         * @param value Element to store.
+         */
         template<typename T> void writeElement(uint8_t* p, const T& value) { std::memcpy(p, &value, sizeof(T)); }
+        /**
+         * @brief Store a boolean in one byte.
+         * @param p     Destination.
+         * @param value Element to store, as 0 or 1.
+         */
         inline void writeElement(uint8_t* p, bool value) { *p = value ? 1 : 0; }
+        /**
+         * @brief Store a complex number as its real part followed by its imaginary part.
+         * @tparam R Type of each part.
+         * @param p     Destination, without any alignment requirement.
+         * @param value Element to store.
+         */
         template<typename R> void writeElement(uint8_t* p, const std::pair<R, R>& value)
         {
             std::memcpy(p, &value.first, sizeof(R));
             std::memcpy(p + sizeof(R), &value.second, sizeof(R));
         }
+        /**
+         * @brief Store a string in a fixed width, padded with NUL or cut to fit.
+         * @param p     Destination.
+         * @param value Text to store.
+         * @param width Width of the field in bytes.
+         */
         inline void writeString(uint8_t* p, const std::string& value, uint64_t width)
         {
             std::memset(p, 0, width);
             std::memcpy(p, value.data(), std::min<uint64_t>(value.size(), width));
         }
 
+        /**
+         * @brief Get the ndarray element type of a column element.
+         * @tparam T Type of an element in memory.
+         * @return The matching libasdf type.
+         */
         template<typename T> asdf_scalar_datatype_t outType()
         {
             if constexpr (std::is_same_v<T, bool>)                  return ASDF_DATATYPE_BOOL8;
@@ -246,11 +372,16 @@ namespace DSL::asdfdetail
             if constexpr (std::is_same_v<T, FITSform::dblcomplex>)  return ASDF_DATATYPE_COMPLEX128;
         }
 
-        // Each method recognises one kind of payload and fills in the column layout for it
+        /** @brief Each method recognises one kind of payload and fills in the column layout for it. */
         struct LayoutVisitor
         {
-            OutColumn& column;
+            OutColumn& column;  //!< Column being described
 
+            /**
+             * @brief Recognise a column with one element of type @p T per row.
+             * @tparam T Type of an element.
+             * @return True if the column is of that kind, and its layout is filled in.
+             */
             template<typename T> bool scalar()
             {
                 if(column.form->payloadType() != std::type_index(typeid(T)))
@@ -261,6 +392,12 @@ namespace DSL::asdfdetail
                 return true;
             }
 
+            /**
+             * @brief Recognise a column with several elements of type @p T per row.
+             * @tparam T Type of an element.
+             * @return True if the column is of that kind, and its layout is filled in.
+             * @throws FITSexception As checkCells().
+             */
             template<typename T> bool vector()
             {
                 if(column.form->payloadType() != std::type_index(typeid(std::vector<T>)))
@@ -274,6 +411,11 @@ namespace DSL::asdfdetail
                 return true;
             }
 
+            /**
+             * @brief Recognise a column of strings, as wide as the longest value (at least one character).
+             * @return True if the column is of that kind, and its layout is filled in.
+             * @throws FITSexception As checkCells().
+             */
             bool strings()
             {
                 if(column.form->payloadType() == std::type_index(typeid(std::string)))
@@ -303,6 +445,13 @@ namespace DSL::asdfdetail
                 return false;
             }
 
+            /**
+             * @brief Check that all cells of a column have the same size.
+             * @tparam V Type of a cell.
+             * @param values Value of each row.
+             * @param repeat Receives the size of a cell, or the declared size (at least 1) without rows.
+             * @throws FITSexception BAD_TFORM for variable-length or empty cells, which have no ASDF form.
+             */
             template<typename V> void checkCells(const std::vector<V>& values, uint64_t& repeat) const
             {
                 if(values.empty())
@@ -319,7 +468,11 @@ namespace DSL::asdfdetail
             }
         };
 
-        // Without any row the storage type isn't known: rely on the declared FITS type
+        /**
+         * @brief Fill in the layout of a column from its declared FITS type.
+         * @details Used without any row, when the storage type isn't known.
+         * @param column Column to describe.
+         */
         void layoutFromType(OutColumn& column)
         {
             ColumnSpec& spec = column.spec;
@@ -349,6 +502,12 @@ namespace DSL::asdfdetail
                 : asdf_scalar_datatype_size(spec.type);
         }
 
+        /**
+         * @brief Call a templated functor for each element type of a table, until it returns true.
+         * @tparam F Type of the functor.
+         * @param f Functor with a template call operator returning a bool.
+         * @return True if a call returned true.
+         */
         template<typename F> bool forEachElementType(F&& f)
         {
             return f.template operator()<bool>()    || f.template operator()<int8_t>()   || f.template operator()<uint8_t>()
@@ -358,6 +517,12 @@ namespace DSL::asdfdetail
                 || f.template operator()<FITSform::complex>() || f.template operator()<FITSform::dblcomplex>();
         }
 
+        /**
+         * @brief Fill in the layout of a column to write, from its payload or else its declared type.
+         * @param column Column to describe.
+         * @param rows   Number of rows of the table.
+         * @throws FITSexception BAD_TFORM if the column has rows of an unknown type, or as LayoutVisitor::checkCells().
+         */
         void computeLayout(OutColumn& column, uint64_t rows)
         {
             LayoutVisitor visitor{column};
@@ -372,6 +537,13 @@ namespace DSL::asdfdetail
             }
         }
 
+        /**
+         * @brief Copy the values of a column into the output rows.
+         * @param column   Column to copy, with its layout.
+         * @param base     First byte of the column in the first row; unused without rows.
+         * @param rowBytes Size of one output row.
+         * @param rows     Number of rows.
+         */
         void copyColumn(const OutColumn& column, uint8_t* base, uint64_t rowBytes, uint64_t rows)
         {
             const FITSform& form = *column.form;
