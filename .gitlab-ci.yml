@@ -6,11 +6,90 @@
 # Note that environment variables can be set in several places
 # See https://docs.gitlab.com/ci/variables/#cicd-variable-precedence
 stages:
+- .pre
+- build
 - test
 - secret-detection
+
 variables:
   SECRET_DETECTION_ENABLED: 'true'
+
+# Extended by each job rather than set globally: secret_detection has its own image, without apt-get.
+.debian:
+  image:
+    name: gcc:13-bookworm
+  variables:
+    DEBIAN_FRONTEND: noninteractive
+    GIT_SUBMODULE_STRATEGY: normal
+    # libfyaml takes its version from the git tags of its submodule, which a shallow clone doesn't have.
+    GIT_DEPTH: "0"
+  before_script:
+    - apt-get update
+    - apt-get install -y cmake make git patch
+    - apt-get install -y build-essential pkg-config autoconf automake libtool ca-certificates
+    # DeepSkyFits
+    - apt-get install -y libgsl-dev
+    # libasdf
+    - apt-get install -y liblz4-dev zlib1g-dev libbz2-dev
+
+# DEEPSKYFITS_TOKEN: CI/CD variable of this project or its group, with read access to deepskyfits.
+deps:
+  extends: .debian
+  stage: .pre
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  script:
+    - mkdir -p deepskyproject
+    - git clone https://oauth2:${DEEPSKYFITS_TOKEN}@gitlab.in2p3.fr/deepskyproject/deepskyfits.git
+    - cd deepskyfits
+    - git submodule update --init --recursive
+    - cmake -DCMAKE_INSTALL_PREFIX=../deepskyproject -Wno-dev -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF .
+    - make -j 2
+    # Configure again: the install rules list headers that only exist after the first build.
+    - cmake -DCMAKE_INSTALL_PREFIX=../deepskyproject -Wno-dev -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF .
+    - make -j 2 install
+  artifacts:
+    expire_in: 24 hrs
+    paths:
+      - deepskyproject/
+
+build:
+  extends: .debian
+  stage: build
+  needs:
+    - job: deps
+      artifacts: true
+  script:
+    - export DeepSkyROOT=$(pwd)/deepskyproject
+    # libDSTfits finds libMinuit2 through this, and the build runs the test program to list its tests.
+    - export LD_LIBRARY_PATH=${DeepSkyROOT}/lib
+    - cmake -S . -B build -Wno-dev
+    - cmake --build build -j 2
+  artifacts:
+    expire_in: 2 hrs
+    paths:
+      - build/
+    exclude:
+      - build/external/**
+
+# Still needs the submodules: the tests read the fixtures of libasdf from the source tree.
+test:
+  extends: .debian
+  stage: test
+  needs:
+    - job: build
+      artifacts: true
+    - job: deps
+      artifacts: true
+  script:
+    - export LD_LIBRARY_PATH=$(pwd)/deepskyproject/lib
+    - cd build
+    - ctest --output-on-failure
+
 secret_detection:
   stage: secret-detection
+  # Runs even if the build or the tests fail.
+  needs: []
+
 include:
 - template: Security/Secret-Detection.gitlab-ci.yml
