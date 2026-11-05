@@ -2,10 +2,11 @@
 //  fits2asdf.h
 //  asdf2fits
 //
-//  Licensed under PolyForm Noncommercial 1.0.0
-//  You may use, share and adapt this code for noncommercial purposes.
-//  Commercial use requires a separate licence from the author.
-//  Licence text: https://polyformproject.org/licenses/noncommercial/1.0.0/
+//  Written by Claude (Anthropic's AI model) for William Gillard.
+//  Copyright (c) 2026 William Gillard.
+//
+//  SPDX-License-Identifier: BSD-3-Clause
+//  Licence text: see the LICENSE file at the root of this project.
 
 #ifndef _DSL_fits2asdf_
 #define _DSL_fits2asdf_
