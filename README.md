@@ -108,4 +108,11 @@ target_link_libraries(myapp asdf2fits::asdf2fits DSTfits::DSTfits)
 
 ## License
 
-PolyForm Noncommercial 1.0.0, as DeepSkyFits. libasdf, libfyaml and libmd keep their own licences.
+asdf2fits is licensed under the [BSD 3-Clause License](LICENSE), the same terms as libasdf. Copyright (c) 2026 William Gillard.
+
+The code was written by Claude, Anthropic's AI model, for William Gillard, who directed the project and is its licensor.
+
+This licence covers the code of asdf2fits only:
+
+- asdf2fits requires [DeepSkyFits](https://gitlab.in2p3.fr/deepskyproject/deepskyfits), which has its own licence, the PolyForm Noncommercial License 1.0.0. That licence still applies to DeepSkyFits when it is used with asdf2fits.
+- The submodules libasdf, libfyaml, libmd and GoogleTest keep their own licences, found in each one's `LICENSE` or `COPYING` file. The [libasdf patch](cmake/patches/libasdf-document-end-marker.patch) is under libasdf's licence.
