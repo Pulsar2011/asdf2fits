@@ -17,13 +17,29 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <DSTfits/FITShdu.h>
 #include <DSTfits/FITSimg.h>
 #include <DSTfits/FITStable.h>
 
+#include "ASDFarray.h"
+#include "ASDFcube.h"
+#include "ASDFnode.h"
+
 namespace DSL
 {
+    /** @brief Options of ASDFmanager. */
+    struct ASDFreadOptions
+    {
+        /**
+         * @brief Size in bytes above which compressed arrays are decompressed to a temporary file rather than
+         * to memory; 0 for libasdf's default.
+         */
+        size_t maxMemoryBytes = 0;
+        std::string tmpDir;     //!< Directory of those temporary files; empty for the system's
+    };
+
     /**
      * @class DSL::ASDFmanager ASDFmanager.h "asdf2fits/ASDFmanager.h"
      * @brief Opens an ASDF file and hands out its content as DeepSkyFits objects.
@@ -42,8 +58,12 @@ namespace DSL
      * Values in an ASDF file are physical: BSCALE and BZERO found in a header are not applied.
      * NaN (real images) or the BLANK value (integer images) mark masked pixels.
      *
+     * Images are ASDFimg\<T\>: FITSimg\<T\> images that also keep the tree of the file and the arrays
+     * that go with them (see ASDFcube). Only their own pixels are read; the other arrays are read when asked.
+     *
      * Each public call locks a mutex of the instance. Objects handed out are independent copies:
-     * changing them doesn't affect the manager, and they outlive it.
+     * changing them doesn't affect the manager, and they outlive it. The arrays they haven't read yet
+     * keep the file open until they are destroyed.
      */
     class ASDFmanager
     {
@@ -55,6 +75,14 @@ namespace DSL
          * BAD_DIMEN, BAD_TFORM or NOT_TABLE if the description of an HDU can't be read.
          */
         explicit ASDFmanager(const std::string& path);
+
+        /**
+         * @brief Open an existing ASDF file and list its HDUs, with options.
+         * @param path    File to open.
+         * @param options How large compressed arrays are decompressed.
+         * @throws FITSexception As ASDFmanager(const std::string&).
+         */
+        ASDFmanager(const std::string& path, const ASDFreadOptions& options);
 
         /** @brief Close the file. */
         ~ASDFmanager();
@@ -77,8 +105,26 @@ namespace DSL
         /**
          * @brief Close the file and forget its HDUs. Objects already handed out stay valid.
          * @details Calling it again has no effect. Afterwards, any call to get an HDU throws FITSexception.
+         * Arrays handed out and not read yet keep the file open until they are destroyed.
          */
         void Close();
+
+        /**
+         * @brief Get the tree of the file.
+         * @details No array is read: ndarrays are ASDFarray handles.
+         * @return A copy of the whole tree.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed.
+         */
+        ASDFnode GetTree();
+
+        /**
+         * @brief Get an ndarray of the file, without reading it.
+         * @param path Path of the ndarray in the tree, as "roman/dq".
+         * @return A handle that reads the array when asked.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed, KEY_NO_EXIST if there is nothing at
+         * @p path, NOT_IMAGE if it isn't an ndarray.
+         */
+        std::shared_ptr<ASDFarray> GetArray(const std::string& path);
 
         /**
          * @brief Get a copy of the header of the primary HDU.
@@ -128,6 +174,20 @@ namespace DSL
          * NOT_IMAGE if it is a table or holds no data, BAD_DATATYPE or READ_ERROR if the pixels can't be loaded.
          */
         std::shared_ptr<FITScube>  GetImage(const std::string& name);
+
+        /**
+         * @brief Read part of the image of an HDU.
+         * @details Only the pixels of the window are read. The companions of the same shape show the same
+         * window, the GWCS objects next to the image are removed, and a history entry records the cut (see
+         * ASDFcube). A FITS WCS of the header is shifted to the window.
+         * @param name   Name of the HDU, matched without regard to case.
+         * @param origin First pixel of the window, NAXIS1 first; missing axes start at 0.
+         * @param size   Length of the window along each axis, NAXIS1 first; missing or 0 lengths, or lengths
+         * going past the end of an axis, go to its end.
+         * @return The image of the window.
+         * @throws FITSexception As GetImage(), or BAD_DIMEN if the window starts outside the image.
+         */
+        std::shared_ptr<FITScube>  GetImageWindow(const std::string& name, const std::vector<size_t>& origin, const std::vector<size_t>& size = {});
 
         /**
          * @brief Read the table of an HDU.

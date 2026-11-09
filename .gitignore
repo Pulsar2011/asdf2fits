@@ -3,6 +3,8 @@
 
 #--------------- Out-of-source build
 /build/
+/build-*/
+/CMakeUserPresets.json
 
 #--------------- In-source build (cmake .)
 /CMakeCache.txt

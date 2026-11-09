@@ -1,5 +1,20 @@
 #-------------------- CMAKE Configuration
 cmake_minimum_required(VERSION 3.21)
+
+# Everything is generated in a build directory, never in the sources: from the project directory,
+# 'cmake --preset default' (or 'cmake -B build'); from a build directory, 'cmake <path to project>'.
+get_filename_component(_src "${CMAKE_SOURCE_DIR}" REALPATH)
+get_filename_component(_bin "${CMAKE_BINARY_DIR}" REALPATH)
+if(_src STREQUAL _bin)
+    message(FATAL_ERROR
+        "In-source builds are not allowed. Remove what this run created:\n"
+        "    rm -rf CMakeCache.txt CMakeFiles\n"
+        "then, from the project directory:\n"
+        "    cmake --preset default        (or: cmake -B build)\n"
+        "    cmake --build build -j\n"
+        "or from a build directory: mkdir build && cd build && cmake .. && make")
+endif()
+
 project(asdf2fits VERSION 0.1.0 LANGUAGES C CXX)
 
 if(NOT WIN32)
@@ -39,6 +54,11 @@ endif()
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
+
+# Products of this build: executables in bin/, libraries in lib/ (objects stay in CMakeFiles/)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 # Same language level as the DeepSky libraries whose headers are compiled here.
 set(CMAKE_CXX_STANDARD 23)
@@ -117,18 +137,66 @@ ExternalProject_Add(libfyaml_external
 
 set(LIBASDF_NAME ${CMAKE_SHARED_LIBRARY_PREFIX}asdf${CMAKE_SHARED_LIBRARY_SUFFIX})
 
-# libasdf is built from a patched copy, until the fix is available upstream. The hash in the command
-# makes the copy start again whenever the patch changes.
+# libasdf is still young and changes fast: say which version is built, with which local patches and
+# which known bugs, so that updating the submodule isn't forgotten.
+# The version is the one libasdf declares in its own CMakeLists.txt.
+file(STRINGS ${CMAKE_SOURCE_DIR}/libasdf/CMakeLists.txt _libasdf_version_line REGEX "^set\\(PACKAGE_VERSION ")
+string(REGEX REPLACE "^set\\(PACKAGE_VERSION +([^ )]+).*" "\\1" LIBASDF_VERSION "${_libasdf_version_line}")
+if(NOT LIBASDF_VERSION)
+    set(LIBASDF_VERSION "unknown")
+endif()
+set(LIBASDF_COMMIT "")
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS ${CMAKE_SOURCE_DIR}/libasdf/.git)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C ${CMAKE_SOURCE_DIR}/libasdf log -1 "--format=%h of %cs"
+        OUTPUT_VARIABLE LIBASDF_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+if(LIBASDF_COMMIT)
+    set(LIBASDF_DESCRIPTION "${LIBASDF_VERSION} (commit ${LIBASDF_COMMIT})")
+else()
+    set(LIBASDF_DESCRIPTION "${LIBASDF_VERSION}")
+endif()
+
+# Bugs of this libasdf that have no patch, only a workaround; each has a test that fails once it is fixed.
+set(LIBASDF_KNOWN_BUGS
+    "asdf_set_*(file, \"a/b\") fails (ASDF_VALUE_ERR_OOM) when mapping a exists; test LibasdfKnownBugs.SetUnderAnExistingMapping"
+)
+
+message("${BoldMagenta}-- libasdf ${LIBASDF_DESCRIPTION}${ColourReset}  https://github.com/asdf-format/libasdf")
+
+# libasdf is built from a patched copy, until the fixes are available upstream: every
+# cmake/patches/libasdf-*.patch is applied, in name order. The hash in the command makes the copy
+# start again whenever a patch is added, changed or removed.
 find_program(PATCH_PROGRAM patch REQUIRED)
 set(LIBASDF_COPY ${CMAKE_BINARY_DIR}/external/libasdf-src)
-set(LIBASDF_PATCH ${CMAKE_SOURCE_DIR}/cmake/patches/libasdf-document-end-marker.patch)
-file(SHA256 ${LIBASDF_PATCH} LIBASDF_PATCH_HASH)
-message("${Blue}-- libasdf patch ${ColourReset} cmake/patches/libasdf-document-end-marker.patch")
+file(GLOB LIBASDF_PATCHES ${CMAKE_SOURCE_DIR}/cmake/patches/libasdf-*.patch)
+list(SORT LIBASDF_PATCHES)
+list(LENGTH LIBASDF_PATCHES LIBASDF_PATCH_COUNT)
+set(LIBASDF_PATCH_HASH "")
+set(LIBASDF_PATCH_NAMES "")
+foreach(patch IN LISTS LIBASDF_PATCHES)
+    file(SHA256 ${patch} hash)
+    string(APPEND LIBASDF_PATCH_HASH ${hash})
+    get_filename_component(name ${patch} NAME)
+    list(APPEND LIBASDF_PATCH_NAMES ${name})
+    # The first line of a patch says what it fixes
+    file(STRINGS ${patch} _summary LIMIT_COUNT 1)
+    message("${Blue}--   patch ${ColourReset} cmake/patches/${name}: ${_summary}")
+endforeach()
+foreach(bug IN LISTS LIBASDF_KNOWN_BUGS)
+    message("${Yellow}--   known bug, not patched ${ColourReset} ${bug}")
+endforeach()
+string(SHA256 LIBASDF_PATCH_HASH "${LIBASDF_PATCH_HASH}")
+# Configure again when a patch changes (its hash) or is added or removed (the directory), or when the
+# submodule is updated (its version)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${LIBASDF_PATCHES} ${CMAKE_SOURCE_DIR}/cmake/patches
+    ${CMAKE_SOURCE_DIR}/libasdf/CMakeLists.txt)
 ExternalProject_Add(libasdf_external
     DEPENDS    libmd_external libfyaml_external
     PREFIX     ${CMAKE_BINARY_DIR}/external/libasdf
     DOWNLOAD_COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/libasdf -DDEST=${LIBASDF_COPY}
-        -DPATCH_FILE=${LIBASDF_PATCH} -DPATCH_PROGRAM=${PATCH_PROGRAM} -DPATCH_HASH=${LIBASDF_PATCH_HASH}
+        -DPATCH_DIR=${CMAKE_SOURCE_DIR}/cmake/patches -DPATCH_PROGRAM=${PATCH_PROGRAM} -DPATCH_HASH=${LIBASDF_PATCH_HASH}
         -P ${CMAKE_SOURCE_DIR}/cmake/PrepareLibasdf.cmake
     SOURCE_DIR ${LIBASDF_COPY}
     BINARY_DIR ${CMAKE_BINARY_DIR}/external/libasdf-build
@@ -163,7 +231,7 @@ message("-- ${Green}Found${ColourReset} DSTfits ${DSTfits_VERSION}: ${DSTfits_DI
 set(DEEPSKY_INCLUDES ${DeepSkyROOT}/include ${DeepSkyROOT}/include/cfitsio ${DeepSkyROOT}/include/Minuit2)
 set(DEEPSKY_RPATH    "${DeepSkyROOT}/lib")
 # This build comes first: an installed copy in DeepSkyROOT must not replace what the tests are testing.
-set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR};${STAGE_DIR}/lib;${DEEPSKY_RPATH}")
+set(CMAKE_BUILD_RPATH "${CMAKE_LIBRARY_OUTPUT_DIRECTORY};${STAGE_DIR}/lib;${DEEPSKY_RPATH}")
 set(CMAKE_INSTALL_RPATH "${DEEPSKY_RPATH}")
 
 #-------------------- libasdf2fits
@@ -173,9 +241,14 @@ set(ASDF2FITS_SOURCES
     src/ASDFheader.cxx
     src/ASDFimage.cxx
     src/ASDFtable.cxx
+    src/ASDFnode.cxx
+    src/ASDFarray.cxx
+    src/ASDFcube.cxx
+    src/ASDFtree.cxx
+    src/ASDFwrite.cxx
     src/fits2asdf.cxx
 )
-set(ASDF2FITS_PUBLIC_HEADERS src/ASDFmanager.h src/fits2asdf.h)
+set(ASDF2FITS_PUBLIC_HEADERS src/ASDFmanager.h src/fits2asdf.h src/ASDFnode.h src/ASDFarray.h src/ASDFcube.h)
 
 if(EXISTS ${CMAKE_SOURCE_DIR}/src/ASDFmanager.cxx)
     add_library(asdf2fits SHARED ${ASDF2FITS_SOURCES})
@@ -189,6 +262,8 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/src/ASDFmanager.cxx)
         PRIVATE ${STAGE_DIR}/include
     )
     target_link_libraries(asdf2fits PUBLIC DSTfits::DSTfits PRIVATE asdf_c)
+    # Written in the history entries of the files it saves
+    target_compile_definitions(asdf2fits PRIVATE ASDF2FITS_VERSION="${PROJECT_VERSION}")
     message("${Blue}-- Public headers ${ColourReset} ${ASDF2FITS_PUBLIC_HEADERS}")
     if(WITH_ASAN)
         target_compile_options(asdf2fits PUBLIC -fsanitize=address -fno-omit-frame-pointer -g)
@@ -237,7 +312,9 @@ if(BUILD_TESTS AND TARGET asdf2fits AND EXISTS ${CMAKE_SOURCE_DIR}/test/gTest_as
     target_link_libraries(gTest_asdf2fits asdf2fits asdf_c gtest gtest_main)
     target_include_directories(gTest_asdf2fits PRIVATE ${STAGE_DIR}/include)
     target_compile_definitions(gTest_asdf2fits PRIVATE
-        ASDF_FIXTURES="${CMAKE_SOURCE_DIR}/libasdf/tests/fixtures")
+        ASDF_FIXTURES="${CMAKE_SOURCE_DIR}/libasdf/tests/fixtures"
+        LIBASDF_VERSION="${LIBASDF_VERSION}"
+        ASDF2FITS_TEST_DIR="${CMAKE_BINARY_DIR}/Testing/Temporary")
     # A timeout, as a parser bug in libasdf shows up as a test that never ends
     gtest_discover_tests(gTest_asdf2fits WORKING_DIRECTORY ${CMAKE_BINARY_DIR} PROPERTIES TIMEOUT 120)
     message("${Blue}-- Test executable ${ColourReset} gTest_asdf2fits (run with ctest)")
@@ -251,5 +328,15 @@ message("${Green}-- Build type       :${ColourReset} ${CMAKE_BUILD_TYPE}")
 message("${Green}-- AddressSanitizer :${ColourReset} ${WITH_ASAN}")
 message("${Green}-- Tests            :${ColourReset} ${ASDF2FITS_TESTS}")
 message("${Green}-- DSTfits          :${ColourReset} ${DSTfits_VERSION}")
+message("${Green}-- libasdf          :${ColourReset} ${LIBASDF_DESCRIPTION}, ${LIBASDF_PATCH_COUNT} local patch(es)")
+foreach(name IN LISTS LIBASDF_PATCH_NAMES)
+    message("${Green}--                    ${ColourReset} patch ${name}")
+endforeach()
+list(LENGTH LIBASDF_KNOWN_BUGS _bug_count)
+if(_bug_count GREATER 0)
+    message("${Yellow}--                     ${_bug_count} known bug(s) without a patch: see above${ColourReset}")
+endif()
+message("${Yellow}--                     libasdf is in early development: check for a newer version, and drop the${ColourReset}")
+message("${Yellow}--                     patches and workarounds it makes useless (a patch that no longer applies stops the build)${ColourReset}")
 message("${Green}-- Install prefix   :${ColourReset} ${CMAKE_INSTALL_PREFIX}")
 message("${BoldGreen}-------------------------------------------------${ColourReset}")

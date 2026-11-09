@@ -6,19 +6,29 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <iostream>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
+
+#include <cstring>
+
+#include <asdf.h>
 
 #include <DSTfits/FITSmanager.h>
 
+#include "ASDFcube.h"
 #include "ASDFmanager.h"
 #include "fits2asdf.h"
 
@@ -31,6 +41,13 @@ namespace
         return std::string(ASDF_FIXTURES) + "/" + name + ".asdf";
     }
 
+    // Files written by the tests go to build/Testing/Temporary (ASDF2FITS_TEST_DIR, set by CMakeLists.txt), never
+    // to the temporary directory of the system. They are removed at the end of each test, unless
+    // ASDF2FITS_KEEP_TEST_FILES is set:
+    //   unset, empty or 0  removed;
+    //   1                  kept in build/Testing/Temporary;
+    //   anything else      the directory to keep them in, created if needed (relative to the working directory).
+    // Each file kept is printed when its test ends.
     class TempFile
     {
     public:
@@ -42,12 +59,38 @@ namespace
             for(char& c : base)
                 if(c == '/')
                     c = '_';
-            path_ = (std::filesystem::temp_directory_path() / (base + "_" + std::to_string(counter++) + extension)).string();
+            path_ = (directory() / (base + "_" + std::to_string(counter++) + extension)).string();
             std::filesystem::remove(path_);
         }
-        ~TempFile() { std::filesystem::remove(path_); }
+        ~TempFile()
+        {
+            if(!keep())
+                std::filesystem::remove(path_);
+            else if(std::filesystem::exists(path_))
+                std::cout << "[   KEPT   ] " << path_ << std::endl;
+        }
         const std::string& path() const { return path_; }
+
     private:
+        static const char* setting()
+        {
+            const char* value = std::getenv("ASDF2FITS_KEEP_TEST_FILES");
+            return (value && *value && std::string(value) != "0") ? value : nullptr;
+        }
+        static bool keep() { return setting() != nullptr; }
+        static std::filesystem::path directory()
+        {
+            const char* value = setting();
+            const std::filesystem::path chosen = (!value || std::string(value) == "1") ? std::filesystem::path(ASDF2FITS_TEST_DIR)
+                                                                                       : std::filesystem::path(value);
+            std::error_code error;
+            if(!std::filesystem::is_directory(chosen, error))
+                std::filesystem::create_directories(chosen, error);
+            if(!std::filesystem::is_directory(chosen, error))
+                throw std::runtime_error("can't create the directory of the test files: " + chosen.string());
+            return chosen;
+        }
+
         std::string path_;
     };
 
@@ -76,6 +119,407 @@ namespace
         for(const T& v : values)
             c->push_back(std::any(v));
         return c;
+    }
+
+    // ------------------------------------------------------------------ Files written with libasdf alone
+
+    struct TestBlock
+    {
+        std::vector<unsigned char> bytes;
+        std::string compression;
+    };
+
+    template<typename T>
+    TestBlock blockOf(const std::vector<T>& values, const std::string& compression = "")
+    {
+        TestBlock block;
+        block.bytes.resize(values.size() * sizeof(T));
+        std::memcpy(block.bytes.data(), values.data(), block.bytes.size());
+        block.compression = compression;
+        return block;
+    }
+
+    // The tree is the YAML below the "--- !core/asdf-1.1.0" line; blocks are little-endian
+    void writeTestFile(const std::string& path, const std::string& tree, const std::vector<TestBlock>& blocks)
+    {
+        const std::string yaml = "#ASDF 1.0.0\n#ASDF_STANDARD 1.6.0\n%YAML 1.1\n%TAG ! tag:stsci.edu:asdf/\n--- !core/asdf-1.1.0\n" + tree + "...\n";
+        asdf_file_t* file = asdf_open_mem(yaml.data(), yaml.size());
+        ASSERT_NE(file, nullptr);
+        for(const TestBlock& block : blocks)
+        {
+            asdf_block_t* b = asdf_block_create(block.bytes.data(), block.bytes.size());
+            ASSERT_NE(b, nullptr);
+            if(!block.compression.empty())
+                ASSERT_EQ(asdf_block_compression_set(b, block.compression.c_str()), 0);
+            ASSERT_NE(asdf_block_append(file, b), nullptr);
+        }
+        ASSERT_EQ(asdf_write_to_file(file, path.c_str()), 0);
+        asdf_close(file);
+    }
+
+    // A file laid out as a Roman data model: an image with err, dq and a calibration array of another shape
+    constexpr size_t kNX = 64;
+    constexpr size_t kNY = 48;
+    float    dataAt (size_t x, size_t y) { return static_cast<float>(y * 1000 + x); }
+    float    errAt  (size_t x, size_t y) { return static_cast<float>(x + y) + 0.25f; }
+    uint32_t dqAt   (size_t x, size_t y) { return (x % 7 == 3 ? 1u : 0u) | (y == 5 ? 4u : 0u); }
+    uint16_t amp33At(size_t x, size_t y) { return static_cast<uint16_t>(y * 10 + x); }
+
+    void writeRoman(const std::string& path)
+    {
+        std::vector<float> data, err;
+        std::vector<uint32_t> dq;
+        std::vector<uint16_t> amp33;
+        for(size_t y = 0; y < kNY; y++)
+        {
+            for(size_t x = 0; x < kNX; x++)
+            {
+                data.push_back(dataAt(x, y));
+                err.push_back(errAt(x, y));
+                dq.push_back(dqAt(x, y));
+            }
+            for(size_t x = 0; x < 4; x++)
+                amp33.push_back(amp33At(x, y));
+        }
+
+        const std::string tree =
+            "history:\n"
+            "  entries:\n"
+            "  - !core/history_entry-1.0.0\n"
+            "    description: made by the test\n"
+            "    time: '2020-01-01T00:00:00'\n"
+            "    software: !core/software-1.0.0 {name: test, version: '1.0'}\n"
+            "roman: !<asdf://stsci.edu/datamodels/roman/tags/wfi_image-1.4.0>\n"
+            "  meta:\n"
+            "    exposure:\n"
+            "      start_time: !time/time-1.4.0 2027-06-01T00:00:00.000\n"
+            "      exposure_time: 133.76\n"
+            "      nresultants: 10\n"
+            "    instrument: {detector: WFI01, name: WFI, optical_element: F158}\n"
+            "    cal_logs: ['first line', \"second line\\nwith a break\"]\n"
+            "    wcs: !<tag:stsci.edu:gwcs/wcs-1.4.0>\n"
+            "      name: detector\n"
+            "      steps:\n"
+            "      - !<tag:stsci.edu:gwcs/step-1.3.0>\n"
+            "        frame: !<tag:stsci.edu:gwcs/frame2d-1.2.0>\n"
+            "          name: detector\n"
+            "          unit: [!unit/unit-1.0.0 pixel, !unit/unit-1.0.0 pixel]\n"
+            "  data: !core/ndarray-1.1.0 {source: 0, datatype: float32, byteorder: little, shape: [48, 64]}\n"
+            "  err: !core/ndarray-1.1.0 {source: 1, datatype: float32, byteorder: little, shape: [48, 64]}\n"
+            "  dq: !core/ndarray-1.1.0 {source: 2, datatype: uint32, byteorder: little, shape: [48, 64]}\n"
+            "  amp33: !core/ndarray-1.1.0 {source: 3, datatype: uint16, byteorder: little, shape: [48, 4]}\n";
+        writeTestFile(path, tree, {blockOf(data), blockOf(err, "lz4"), blockOf(dq, "zlib"), blockOf(amp33, "bzp2")});
+    }
+
+    // The compression and the bytes, as stored, of the block of an ndarray
+    std::pair<std::string, std::string> rawBlock(const std::string& path, const std::string& array)
+    {
+        asdf_file_t* file = asdf_open_file(path.c_str(), "r");
+        if(!file)
+            return {};
+        asdf_ndarray_t* ndarray = nullptr;
+        std::pair<std::string, std::string> result;
+        if(asdf_get_ndarray(file, array.c_str(), &ndarray) == ASDF_VALUE_OK)
+        {
+            asdf_block_t* block = asdf_block_open(file, ndarray->source);
+            size_t size = 0;
+            const void* raw = asdf_block_data_raw(block, &size);
+            result.first = asdf_block_compression(block);
+            result.second.assign(static_cast<const char*>(raw), size);
+            asdf_block_close(block);
+            asdf_ndarray_destroy(ndarray);
+        }
+        asdf_close(file);
+        return result;
+    }
+
+    // Two trees hold the same: tags, keys, values, and arrays of the same shape, type and pixels
+    void expectSameTree(const ASDFnode& a, const ASDFnode& b, const std::string& path = "")
+    {
+        if(a.IsArray() || b.IsArray())
+        {
+            ASSERT_TRUE(a.IsArray() && b.IsArray()) << path;
+            EXPECT_EQ(a.Array()->Shape(), b.Array()->Shape()) << path;
+            EXPECT_EQ(a.Array()->DataType(), b.Array()->DataType()) << path;
+            if(a.Array()->IsImage())
+            {
+                auto pa = a.Array()->Read({});
+                auto pb = b.Array()->Read({});
+                ASSERT_EQ(pa->Nelements(), pb->Nelements()) << path;
+                for(size_t i = 0; i < pa->Nelements(); i++)
+                    ASSERT_TRUE(pa->at(i) == pb->at(i) || (std::isnan(pa->at(i)) && std::isnan(pb->at(i)))) << path << " [" << i << "]";
+            }
+            return;
+        }
+        EXPECT_EQ(a.Tag(), b.Tag()) << path;
+        ASSERT_EQ(a.GetKind(), b.GetKind()) << path;
+        if(a.IsMapping() || a.IsSequence())
+        {
+            ASSERT_EQ(a.Keys(), b.Keys()) << path;
+            ASSERT_EQ(a.Size(), b.Size()) << path;
+            for(size_t i = 0; i < a.Size(); i++)
+                expectSameTree(a.Items()[i], b.Items()[i], path + "/" + (a.IsMapping() ? a.Keys()[i] : std::to_string(i)));
+            return;
+        }
+        EXPECT_TRUE(a == b) << path << ": " << a.Text() << " vs " << b.Text();
+    }
+
+    std::shared_ptr<ASDFcube> asASDF(const std::shared_ptr<FITScube>& cube)
+    {
+        return std::dynamic_pointer_cast<ASDFcube>(cube);
+    }
+
+    // ------------------------------------------------------------------ Multi-HDU file built with the libasdf API
+    //
+    // Every pixel type has its own HDU, of its own shape, byte order and compression, so that one file covers
+    // what a reader has to get right. Nothing below goes through asdf2fits: the arrays are written with
+    // asdf_set_ndarray() and read back with asdf_ndarray_read_all().
+
+    template<typename F>
+    void forEachPixelType(F&& f)
+    {
+        f.template operator()<int8_t>();
+        f.template operator()<uint8_t>();
+        f.template operator()<int16_t>();
+        f.template operator()<uint16_t>();
+        f.template operator()<int32_t>();
+        f.template operator()<uint32_t>();
+        f.template operator()<int64_t>();
+        f.template operator()<uint64_t>();
+        f.template operator()<float>();
+        f.template operator()<double>();
+    }
+
+    template<typename T>
+    constexpr asdf_scalar_datatype_t asdfTypeOf()
+    {
+        if constexpr(std::is_same_v<T, int8_t>)   return ASDF_DATATYPE_INT8;
+        else if constexpr(std::is_same_v<T, uint8_t>)  return ASDF_DATATYPE_UINT8;
+        else if constexpr(std::is_same_v<T, int16_t>)  return ASDF_DATATYPE_INT16;
+        else if constexpr(std::is_same_v<T, uint16_t>) return ASDF_DATATYPE_UINT16;
+        else if constexpr(std::is_same_v<T, int32_t>)  return ASDF_DATATYPE_INT32;
+        else if constexpr(std::is_same_v<T, uint32_t>) return ASDF_DATATYPE_UINT32;
+        else if constexpr(std::is_same_v<T, int64_t>)  return ASDF_DATATYPE_INT64;
+        else if constexpr(std::is_same_v<T, uint64_t>) return ASDF_DATATYPE_UINT64;
+        else if constexpr(std::is_same_v<T, float>)    return ASDF_DATATYPE_FLOAT32;
+        else if constexpr(std::is_same_v<T, double>)   return ASDF_DATATYPE_FLOAT64;
+        else static_assert(sizeof(T) == 0, "not a pixel type");
+    }
+
+    template<typename T>
+    std::string asdfNameOf()
+    {
+        if constexpr(std::is_same_v<T, float>)  return "float32";
+        else if constexpr(std::is_same_v<T, double>) return "float64";
+        else
+            return std::string(std::is_signed_v<T> ? "int" : "uint") + std::to_string(8 * sizeof(T));
+    }
+
+    // One HDU of the file: the ndarray is at <group>/data, next to the scalars <group>/label and <group>/rank
+    struct ArraySpec
+    {
+        std::string group;
+        std::vector<uint64_t> shape;    // numpy order: the last one is NAXIS1
+        asdf_byteorder_t order;
+        std::string compression;        // "" for none
+        uint64_t salt;                  // makes the pixels of each HDU different
+    };
+
+    template<typename T>
+    ArraySpec specOf()
+    {
+        if constexpr(std::is_same_v<T, int8_t>)   return {"i8",  {6},          ASDF_BYTEORDER_LITTLE, "",     1};
+        else if constexpr(std::is_same_v<T, uint8_t>)  return {"u8",  {5, 7},       ASDF_BYTEORDER_LITTLE, "bzp2", 2};
+        else if constexpr(std::is_same_v<T, int16_t>)  return {"i16", {3, 4, 5},    ASDF_BYTEORDER_BIG,    "",     3};
+        else if constexpr(std::is_same_v<T, uint16_t>) return {"u16", {7, 6},       ASDF_BYTEORDER_LITTLE, "lz4",  4};
+        else if constexpr(std::is_same_v<T, int32_t>)  return {"i32", {2, 3, 4, 5}, ASDF_BYTEORDER_LITTLE, "zlib", 5};
+        else if constexpr(std::is_same_v<T, uint32_t>) return {"u32", {9, 4},       ASDF_BYTEORDER_BIG,    "",     6};
+        else if constexpr(std::is_same_v<T, int64_t>)  return {"i64", {3, 2, 4},    ASDF_BYTEORDER_LITTLE, "",     7};
+        else if constexpr(std::is_same_v<T, uint64_t>) return {"u64", {11},         ASDF_BYTEORDER_BIG,    "zlib", 8};
+        else if constexpr(std::is_same_v<T, float>)    return {"f32", {8, 5},       ASDF_BYTEORDER_BIG,    "lz4",  9};
+        else if constexpr(std::is_same_v<T, double>)   return {"f64", {4, 3, 2},    ASDF_BYTEORDER_LITTLE, "bzp2", 10};
+        else static_assert(sizeof(T) == 0, "not a pixel type");
+    }
+
+    std::vector<size_t> axesOf(const std::vector<uint64_t>& shape)
+    {
+        return std::vector<size_t>(shape.rbegin(), shape.rend());
+    }
+
+    // The extremes of the type first, then values of both signs that differ from one pixel to the next
+    template<typename T>
+    T pixelValue(size_t i, uint64_t salt)
+    {
+        if(i == 0)
+            return std::numeric_limits<T>::lowest();
+        if(i == 1)
+            return std::numeric_limits<T>::max();
+        const uint64_t magnitude = 3 * i + salt;
+        if constexpr(std::is_floating_point_v<T>)
+            return static_cast<T>((i % 2 ? -0.375 : 0.625) * static_cast<double>(magnitude));
+        else if constexpr(std::is_signed_v<T>)
+            return static_cast<T>(i % 2 ? -static_cast<int64_t>(magnitude) : static_cast<int64_t>(magnitude));
+        else
+            return static_cast<T>(magnitude);
+    }
+
+    // Pixels of an HDU, in file order (the last axis of the shape varies fastest), which is also FITS order
+    template<typename T>
+    std::vector<T> pixelsOf(const ArraySpec& spec, uint64_t salt)
+    {
+        size_t n = 1;
+        for(uint64_t length : spec.shape)
+            n *= length;
+        std::vector<T> values(n);
+        for(size_t i = 0; i < n; i++)
+            values[i] = pixelValue<T>(i, salt);
+        return values;
+    }
+
+    template<typename T>
+    std::vector<T> pixelsOf(const ArraySpec& spec) { return pixelsOf<T>(spec, spec.salt); }
+
+    // libasdf 0.3.0 can't add a key to a mapping that is already in the tree: asdf_set_*(file, "a/b") fails
+    // with ASDF_VALUE_ERR_OOM when "a" exists (asdf_node_materialize_path appends "a" to its parent again).
+    // So each mapping is built whole, as asdf2fits does, and put in the tree once.
+    // LibasdfKnownBugs.SetUnderAnExistingMapping fails once a libasdf without the bug is built.
+    template<typename T>
+    void setNdarray(asdf_file_t* file, asdf_mapping_t* mapping, const std::string& key, const std::vector<uint64_t>& shape,
+                    const std::vector<T>& values, asdf_byteorder_t order, const std::string& compression)
+    {
+        asdf_ndarray_t ndarray{};
+        ndarray.datatype.type = asdfTypeOf<T>();
+        ndarray.byteorder = order;
+        ndarray.ndim = static_cast<uint32_t>(shape.size());
+        ndarray.shape = shape.data();
+
+        // The bytes are given as stored: in the byte order announced
+        std::vector<unsigned char> bytes(values.size() * sizeof(T));
+        std::memcpy(bytes.data(), values.data(), bytes.size());
+        if((order == ASDF_BYTEORDER_BIG) != (std::endian::native == std::endian::big))
+            for(size_t i = 0; i < bytes.size(); i += sizeof(T))
+                std::reverse(bytes.begin() + static_cast<std::ptrdiff_t>(i), bytes.begin() + static_cast<std::ptrdiff_t>(i + sizeof(T)));
+
+        ASSERT_EQ(asdf_ndarray_data_copy(&ndarray, bytes.data()), ASDF_NDARRAY_OK) << key;
+        if(!compression.empty() && asdf_ndarray_compression_set(&ndarray, compression.c_str()) != 0)
+        {
+            asdf_ndarray_data_dealloc(&ndarray);
+            FAIL() << key << ": compression " << compression << " refused";
+        }
+        // The file takes the data: it is freed when the file is closed
+        asdf_value_t* value = asdf_value_of_ndarray(file, &ndarray);
+        if(!value)
+        {
+            asdf_ndarray_data_dealloc(&ndarray);
+            FAIL() << key << ": " << (asdf_error(file) ? asdf_error(file) : "asdf_value_of_ndarray failed");
+        }
+        ASSERT_EQ(asdf_mapping_set(mapping, key.c_str(), value), ASDF_VALUE_OK) << key;
+    }
+
+    // Put a mapping built with asdf_mapping_create() at a key of the root; the file takes it
+    void setGroup(asdf_file_t* file, const std::string& key, asdf_mapping_t* mapping)
+    {
+        ASSERT_NE(mapping, nullptr) << key;
+        ASSERT_EQ(asdf_set_mapping(file, key.c_str(), mapping), ASDF_VALUE_OK) << key;
+    }
+
+    // A mapping whose image has companions, as in the data models of Roman or JWST
+    constexpr size_t kSciNX = 8;
+    constexpr size_t kSciNY = 6;
+    float    sciDataAt(size_t x, size_t y) { return static_cast<float>(y * 100 + x) + 0.5f; }
+    float    sciErrAt (size_t x, size_t y) { return 0.25f * static_cast<float>(x + y) + 1.f; }
+    uint16_t sciDqAt  (size_t x, size_t y) { return static_cast<uint16_t>((x == 2 ? 1 : 0) | (y == 4 ? 2 : 0)); }
+
+    constexpr int kMultiHDUs = 10 + 3;      // one per pixel type, and sci/data, sci/err, sci/dq
+
+    void writeMultiHDU(const std::string& path)
+    {
+        asdf_file_t* file = asdf_open_mem(nullptr, 0);
+        ASSERT_NE(file, nullptr);
+
+        // Scalars at the root: keywords of the primary HDU
+        EXPECT_EQ(asdf_set_string0(file, "object", "NGC 1300"), ASDF_VALUE_OK);
+        EXPECT_EQ(asdf_set_double(file, "exptime", 87.5), ASDF_VALUE_OK);
+        EXPECT_EQ(asdf_set_int64(file, "ncombine", -12), ASDF_VALUE_OK);
+        EXPECT_EQ(asdf_set_bool(file, "calibrated", true), ASDF_VALUE_OK);
+
+        forEachPixelType([&]<typename T>()
+        {
+            const ArraySpec spec = specOf<T>();
+            asdf_mapping_t* group = asdf_mapping_create(file);
+            ASSERT_NE(group, nullptr) << spec.group;
+            EXPECT_EQ(asdf_mapping_set_string0(group, "label", (spec.group + " image").c_str()), ASDF_VALUE_OK);
+            EXPECT_EQ(asdf_mapping_set_int64(group, "rank", static_cast<int64_t>(spec.shape.size())), ASDF_VALUE_OK);
+            setNdarray<T>(file, group, "data", spec.shape, pixelsOf<T>(spec), spec.order, spec.compression);
+            setGroup(file, spec.group, group);
+        });
+
+        std::vector<float> data, err;
+        std::vector<uint16_t> dq;
+        for(size_t y = 0; y < kSciNY; y++)
+            for(size_t x = 0; x < kSciNX; x++)
+            {
+                data.push_back(sciDataAt(x, y));
+                err.push_back(sciErrAt(x, y));
+                dq.push_back(sciDqAt(x, y));
+            }
+        asdf_mapping_t* sci = asdf_mapping_create(file);
+        ASSERT_NE(sci, nullptr);
+        EXPECT_EQ(asdf_mapping_set_string0(sci, "telescope", "Euclid"), ASDF_VALUE_OK);
+        setNdarray<float>(file, sci, "data", {kSciNY, kSciNX}, data, ASDF_BYTEORDER_LITTLE, "");
+        setNdarray<float>(file, sci, "err", {kSciNY, kSciNX}, err, ASDF_BYTEORDER_BIG, "lz4");
+        setNdarray<uint16_t>(file, sci, "dq", {kSciNY, kSciNX}, dq, ASDF_BYTEORDER_LITTLE, "zlib");
+        setGroup(file, "sci", sci);
+
+        EXPECT_EQ(asdf_write_to_file(file, path.c_str()), 0);
+        asdf_close(file);
+    }
+
+    // An ndarray as libasdf alone reads it: pixels in the native byte order, of the type stored
+    struct LibasdfArray
+    {
+        asdf_scalar_datatype_t type = ASDF_DATATYPE_UNKNOWN;
+        std::vector<uint64_t> shape;
+        std::string compression;
+        std::vector<unsigned char> bytes;
+
+        template<typename T>
+        std::vector<T> values() const
+        {
+            std::vector<T> out(bytes.size() / sizeof(T));
+            std::memcpy(out.data(), bytes.data(), out.size() * sizeof(T));
+            return out;
+        }
+    };
+
+    void readNdarray(const std::string& path, const std::string& array, LibasdfArray& out)
+    {
+        asdf_file_t* file = asdf_open_file(path.c_str(), "r");
+        ASSERT_NE(file, nullptr) << path;
+        asdf_ndarray_t* ndarray = nullptr;
+        if(asdf_get_ndarray(file, array.c_str(), &ndarray) != ASDF_VALUE_OK || !ndarray)
+        {
+            asdf_close(file);
+            FAIL() << "no ndarray at " << array << " in " << path;
+        }
+        out.type = ndarray->datatype.type;
+        out.shape.assign(ndarray->shape, ndarray->shape + ndarray->ndim);
+        if(asdf_block_t* block = asdf_block_open(file, ndarray->source))
+        {
+            out.compression = asdf_block_compression(block);
+            asdf_block_close(block);
+        }
+        void* data = nullptr;
+        const asdf_ndarray_err_t status = asdf_ndarray_read_all(ndarray, ASDF_DATATYPE_SOURCE, &data);
+        if(status == ASDF_NDARRAY_OK && data)
+        {
+            const auto* first = static_cast<const unsigned char*>(data);
+            out.bytes.assign(first, first + asdf_ndarray_nbytes(ndarray));
+        }
+        asdf_free(data);
+        asdf_ndarray_destroy(ndarray);
+        asdf_close(file);
+        ASSERT_EQ(status, ASDF_NDARRAY_OK) << array;
     }
 }
 
@@ -720,4 +1164,962 @@ TEST(ASDFparser, DocumentEndMarkerFollowedByOtherBytes)
     }
     // The content isn't valid YAML, so an error is fine: only returning matters.
     try { ASDFmanager asdf(file.path()); asdf.NumberOfHeader(); } catch(const FITSexception&) {}
+}
+
+// ---------------------------------------------------------------------- ASDF trees
+
+TEST(ASDFnode, PathsKindsAndValues)
+{
+    const std::string key = "x/y~z";
+    const std::string path = ASDFnode::ChildPath("a", key);
+    EXPECT_EQ(path, "a/x~1y~0z");
+    EXPECT_EQ(ASDFnode::SplitPath(path), (std::vector<std::string>{"a", key}));
+    EXPECT_EQ(ASDFnode::ParentPath(path), "a");
+
+    ASDFnode tree;
+    tree.SetPath(path, 3);
+    ASSERT_TRUE(tree.IsMapping());
+    EXPECT_EQ(tree["a"][key].Get<int>(), 3);
+    EXPECT_EQ(tree.At(path).Get<double>(), 3.);
+    EXPECT_THROW(tree.At("a/missing"), FITSexception);
+    EXPECT_THROW(tree.At(path).Get<std::string>(), FITSexception);
+    EXPECT_THROW(ASDFnode(300).Get<int8_t>(), FITSexception);
+    EXPECT_TRUE(ASDFnode(int64_t(5)) == ASDFnode(uint64_t(5)));
+    EXPECT_FALSE(ASDFnode(5) == ASDFnode(5.));
+
+    // A time replaced by another scalar stays a time
+    tree.SetPath("when", ASDFnode("2020-01-01"));
+    tree.At("when").SetTag("tag:stsci.edu:asdf/time/time-1.4.0");
+    tree.SetPath("when", ASDFnode("2021-01-01"));
+    EXPECT_EQ(tree.At("when").Tag(), "tag:stsci.edu:asdf/time/time-1.4.0");
+    EXPECT_EQ(tree.At("when").Get<std::string>(), "2021-01-01");
+
+    ASDFnode& list = tree["list"];
+    list.Append(1);
+    list.Append("two");
+    EXPECT_EQ(tree.At("list/1").Get<std::string>(), "two");
+    EXPECT_EQ(tree.Keys(), (std::vector<std::string>{"a", "when", "list"}));
+
+    EXPECT_TRUE(tree.ErasePath("list/0"));
+    EXPECT_EQ(tree.At("list/0").Get<std::string>(), "two");
+    EXPECT_TRUE(tree.ErasePath(path));
+    EXPECT_EQ(tree.FindPath(path), nullptr);
+
+    // Reals are written so that they read back as reals
+    EXPECT_EQ(ASDFnode(2.).Text(), "2.0");
+    EXPECT_EQ(ASDFnode(1e20).Text(), "1.0e+20");
+    EXPECT_EQ(ASDFnode(std::nan("")).Text(), ".nan");
+}
+
+TEST(ASDFtree, ReadKeepsTagsAndTypesAndReadsNoArray)
+{
+    TempFile path(".asdf");
+    writeRoman(path.path());
+    ASDFmanager file(path.path());
+    ASDFnode tree = file.GetTree();
+
+    EXPECT_EQ(tree.At("roman").Tag(), "asdf://stsci.edu/datamodels/roman/tags/wfi_image-1.4.0");
+    const ASDFnode& start = tree.At("roman/meta/exposure/start_time");
+    EXPECT_EQ(start.Get<std::string>(), "2027-06-01T00:00:00.000");
+    EXPECT_EQ(start.Tag(), "tag:stsci.edu:asdf/time/time-1.4.0");
+    EXPECT_EQ(tree.At("roman/meta/exposure/nresultants").Get<int>(), 10);
+    EXPECT_DOUBLE_EQ(tree.At("roman/meta/exposure/exposure_time").Get<double>(), 133.76);
+    EXPECT_EQ(tree.At("roman/meta/cal_logs/1").Get<std::string>(), "second line\nwith a break");
+    EXPECT_TRUE(tree.At("roman/meta/wcs").HasTag("gwcs/wcs-"));
+    EXPECT_EQ(tree.At("roman/meta/wcs/steps/0/frame/unit/1").Tag(), "tag:stsci.edu:asdf/unit/unit-1.0.0");
+
+    auto dq = tree.At("roman/dq").Array();
+    ASSERT_TRUE(dq);
+    EXPECT_FALSE(dq->IsLoaded());
+    EXPECT_TRUE(dq->IsInFile());
+    EXPECT_TRUE(dq->IsImage());
+    EXPECT_EQ(dq->Shape(), (std::vector<uint64_t>{kNY, kNX}));
+    EXPECT_EQ(dq->Axes(), (std::vector<size_t>{kNX, kNY}));
+    EXPECT_EQ(dq->DataType(), "uint32");
+    EXPECT_EQ(dq->Bytes(), kNX * kNY * 4);
+    EXPECT_EQ(dq->Compression(), "zlib");
+    EXPECT_EQ(tree.At("roman/data").Array()->Compression(), "");
+    EXPECT_DOUBLE_EQ(dq->ValueAt({3, 5}), dqAt(3, 5));
+    EXPECT_FALSE(dq->IsLoaded());
+
+    auto header = file.GetHeader("roman.data");
+    EXPECT_EQ(header->GetInt64ValueForKey("META.EXPOSURE.NRESULTANTS"), 10);
+    EXPECT_EQ(header->GetValueForKey("META.INSTRUMENT.NAME"), "WFI");
+}
+
+// ---------------------------------------------------------------------- ASDF images
+
+TEST(ASDFimage, IsAFITSimgAndAnASDFcube)
+{
+    TempFile path(".asdf");
+    writeRoman(path.path());
+    ASDFmanager file(path.path());
+    auto image = file.GetImage("roman.data");
+
+    EXPECT_TRUE(std::dynamic_pointer_cast<FITSimg<float>>(image));
+    auto asdf = asASDF(image);
+    ASSERT_TRUE(asdf);
+    EXPECT_EQ(&asdf->Cube(), image.get());
+    EXPECT_EQ(asdf->ImagePath(), "roman/data");
+    EXPECT_EQ(asdf->CompanionNames(), (std::vector<std::string>{"err", "dq", "amp33"}));
+    for(const char* name : {"err", "dq", "amp33"})
+        EXPECT_FALSE(asdf->Companion(name)->IsLoaded()) << name;
+    EXPECT_EQ(asdf->Companion("nothing"), nullptr);
+
+    EXPECT_EQ(image->Size(1), kNX);
+    EXPECT_EQ(image->Size(2), kNY);
+    EXPECT_DOUBLE_EQ(image->at(5 * kNX + 7), dataAt(7, 5));
+
+    // The FITS side works as for any image
+    TempFile fits(".fits");
+    image->Write(fits.path());
+    FITSmanager back(fits.path());
+    EXPECT_DOUBLE_EQ(back.GetPrimary()->at(5 * kNX + 7), dataAt(7, 5));
+}
+
+TEST(ASDFimage, WindowCutsTheCompanionsWithoutReadingThem)
+{
+    TempFile in(".asdf"), out(".asdf");
+    writeRoman(in.path());
+    ASDFmanager file(in.path());
+    auto image = file.GetImage("roman.data");
+
+    auto cut = image->Window(10, 20, 30, 16);
+    auto asdf = asASDF(cut);
+    ASSERT_TRUE(asdf);
+    EXPECT_EQ(cut->Size(1), 30u);
+    EXPECT_EQ(cut->Size(2), 16u);
+    EXPECT_DOUBLE_EQ(cut->at(0), dataAt(10, 20));
+
+    auto err = asdf->Companion("err");
+    ASSERT_TRUE(err);
+    EXPECT_TRUE(err->HasView());
+    EXPECT_FALSE(err->IsLoaded());
+    EXPECT_EQ(err->Axes(), (std::vector<size_t>{30, 16}));
+    EXPECT_FLOAT_EQ(static_cast<float>(err->Load()->at(1 * 30 + 2)), errAt(12, 21));
+    EXPECT_EQ(asdf->Companion("amp33")->Axes(), (std::vector<size_t>{4, kNY}));
+    EXPECT_EQ(asdf->Meta().FindPath("roman/meta/wcs"), nullptr);
+    ASSERT_EQ(asdf->PendingHistory().size(), 1u);
+    EXPECT_NE(asdf->PendingHistory()[0].find("Window"), std::string::npos);
+
+    // The image it was cut from is unchanged
+    EXPECT_FALSE(asASDF(image)->Companion("err")->HasView());
+    EXPECT_NE(asASDF(image)->Meta().FindPath("roman/meta/wcs"), nullptr);
+
+    asdf->WriteASDF(out.path());
+    ASDFmanager back(out.path());
+    ASDFnode tree = back.GetTree();
+    for(const char* name : {"data", "err", "dq"})
+        EXPECT_EQ(tree.At(std::string("roman/") + name).Array()->Axes(), (std::vector<size_t>{30, 16})) << name;
+    EXPECT_EQ(tree.At("roman/amp33").Array()->Axes(), (std::vector<size_t>{4, kNY}));
+    EXPECT_DOUBLE_EQ(tree.At("roman/dq").Array()->ValueAt({3, 2}), dqAt(13, 22));
+    EXPECT_DOUBLE_EQ(back.GetImage("roman.data")->at(0), dataAt(10, 20));
+    EXPECT_EQ(tree.FindPath("roman/meta/wcs"), nullptr);
+    EXPECT_EQ(tree.At("roman/meta/exposure/start_time").Tag(), "tag:stsci.edu:asdf/time/time-1.4.0");
+
+    const ASDFnode& entries = tree.At("history/entries");
+    ASSERT_EQ(entries.Size(), 2u);
+    EXPECT_NE(entries[1].At("description").Get<std::string>().find("Window"), std::string::npos);
+    EXPECT_EQ(entries[1].At("software/name").Get<std::string>(), "asdf2fits");
+    EXPECT_FALSE(entries[1].At("time").Get<std::string>().empty());
+}
+
+TEST(ASDFimage, ResizeCutsTheCompanionsToo)
+{
+    TempFile in(".asdf");
+    writeRoman(in.path());
+    ASDFmanager file(in.path());
+    auto image = file.GetImage("roman.data");
+    image->Resize(4, 6, 32, 24);
+
+    auto asdf = asASDF(image);
+    EXPECT_EQ(asdf->Companion("dq")->Axes(), (std::vector<size_t>{32, 24}));
+    EXPECT_DOUBLE_EQ(asdf->Companion("dq")->ValueAt({0, 0}), dqAt(4, 6));
+    EXPECT_DOUBLE_EQ(image->at(0), dataAt(4, 6));
+}
+
+TEST(ASDFimage, LayerTakesTheSameLayerOfTheCompanions)
+{
+    TempFile in(".asdf"), out(".asdf");
+    std::vector<int16_t> cube;
+    std::vector<double> var;
+    for(int z = 0; z < 3; z++)
+        for(int y = 0; y < 5; y++)
+            for(int x = 0; x < 4; x++)
+            {
+                cube.push_back(static_cast<int16_t>(z * 100 + y * 10 + x));
+                var.push_back((z * 100 + y * 10 + x) * 0.5);
+            }
+    writeTestFile(in.path(),
+        "sci:\n"
+        "  data: !core/ndarray-1.1.0 {source: 0, datatype: int16, byteorder: little, shape: [3, 5, 4]}\n"
+        "  var: !core/ndarray-1.1.0 {source: 1, datatype: float64, byteorder: little, shape: [3, 5, 4]}\n",
+        {blockOf(cube), blockOf(var, "zlib")});
+
+    ASDFmanager file(in.path());
+    auto layer = file.GetImage("sci.data")->Layer(1);
+    auto asdf = asASDF(layer);
+    ASSERT_TRUE(asdf);
+    EXPECT_EQ(layer->GetDimension(), 2u);
+    EXPECT_DOUBLE_EQ(layer->at(0), 100.);
+
+    auto companion = asdf->Companion("var");
+    EXPECT_EQ(companion->Axes(), (std::vector<size_t>{4, 5}));
+    EXPECT_FALSE(companion->IsLoaded());
+    EXPECT_DOUBLE_EQ(companion->Load()->at(13), 131 * 0.5);   // x = 1, y = 3
+
+    asdf->WriteASDF(out.path());
+    ASDFmanager back(out.path());
+    EXPECT_EQ(back.GetArray("sci/var")->Shape(), (std::vector<uint64_t>{5, 4}));
+    EXPECT_DOUBLE_EQ(back.GetArray("sci/var")->ValueAt({1, 3}), 131 * 0.5);
+}
+
+TEST(ASDFimage, RebinDropsTheCompanionsOfTheImageShape)
+{
+    TempFile in(".asdf");
+    writeRoman(in.path());
+    ASDFmanager file(in.path());
+    auto binned = file.GetImage("roman.data")->Rebin({2, 2});
+    auto asdf = asASDF(binned);
+    ASSERT_TRUE(asdf);
+    EXPECT_EQ(binned->Size(1), kNX / 2);
+    EXPECT_EQ(asdf->CompanionNames(), (std::vector<std::string>{"amp33"}));
+    EXPECT_EQ(asdf->Meta().FindPath("roman/err"), nullptr);
+    EXPECT_EQ(asdf->Meta().FindPath("roman/meta/wcs"), nullptr);
+    ASSERT_EQ(asdf->PendingHistory().size(), 1u);
+    EXPECT_NE(asdf->PendingHistory()[0].find("dropped: err, dq"), std::string::npos);
+
+    // FITSimg gives the result a header of its own: the metadata must survive anyway
+    EXPECT_EQ(binned->HDU().GetValueForKey("META.INSTRUMENT.NAME"), "WFI");
+    TempFile out(".asdf");
+    asdf->WriteASDF(out.path());
+    ASDFnode tree = ASDFmanager(out.path()).GetTree();
+    EXPECT_EQ(tree.At("roman/meta/instrument/name").Get<std::string>(), "WFI");
+    EXPECT_EQ(tree.At("roman/meta/exposure/nresultants").Get<int>(), 10);
+    EXPECT_EQ(tree.At("roman/data").Array()->Axes(), (std::vector<size_t>{kNX / 2, kNY / 2}));
+}
+
+TEST(ASDFimage, ShapeChangedOutsideTheHooksDropsTheCompanions)
+{
+    TempFile in(".asdf"), out(".asdf");
+    writeRoman(in.path());
+    ASDFmanager file(in.path());
+    auto image = file.GetImage("roman.data");
+
+    // A call through the FITSimg type, which ASDFimg can't see
+    FITSimg<float>& plain = dynamic_cast<FITSimg<float>&>(*image);
+    plain.FITSimg<float>::AddLayer(static_cast<const FITSimg<float>&>(*ramp<float>({kNX, kNY})));
+    ASSERT_EQ(image->GetDimension(), 3u);
+
+    auto asdf = asASDF(image);
+    EXPECT_EQ(asdf->CompanionNames(), (std::vector<std::string>{"amp33"}));
+    asdf->WriteASDF(out.path());
+    ASDFnode tree = ASDFmanager(out.path()).GetTree();
+    EXPECT_EQ(tree.FindPath("roman/err"), nullptr);
+    EXPECT_NE(tree.FindPath("roman/amp33"), nullptr);
+    EXPECT_EQ(tree.FindPath("roman/meta/wcs"), nullptr);
+    EXPECT_NE(tree.At("history/entries/1/description").Get<std::string>().find("reshaped"), std::string::npos);
+}
+
+TEST(ASDFimage, MaskFromDQReadsTheFlagsAndFreesThem)
+{
+    TempFile in(".asdf");
+    writeRoman(in.path());
+    ASDFmanager file(in.path());
+    auto image = file.GetImage("roman.data");
+    auto asdf = asASDF(image);
+
+    EXPECT_EQ(asdf->MaskFromDQ(1), 9 * kNY);   // x % 7 == 3: 9 pixels per row
+    EXPECT_TRUE(image->Masked(size_t(5 * kNX + 3)));
+    EXPECT_FALSE(image->Masked(size_t(0)));
+    EXPECT_FALSE(asdf->Companion("dq")->IsLoaded());
+
+    EXPECT_EQ(asdf->MaskFromDQ(4), kNX);       // all of row 5
+    EXPECT_TRUE(image->Masked(size_t(5 * kNX)));
+    EXPECT_THROW(asdf->MaskFromDQ(1, "err"), FITSexception);
+    EXPECT_THROW(asdf->MaskFromDQ(1, "amp33"), FITSexception);
+    EXPECT_THROW(asdf->MaskFromDQ(1, "nothing"), FITSexception);
+}
+
+TEST(ASDFimage, AsdfLikeGivesAResultTheTree)
+{
+    TempFile in(".asdf");
+    writeRoman(in.path());
+    ASDFmanager file(in.path());
+    auto model = asASDF(file.GetImage("roman.data"));
+
+    // Kept elsewhere: copied
+    auto stack = ramp<float>({kNX, kNY});
+    auto like = asASDF(asdfLike(stack, *model, "stacked"));
+    ASSERT_TRUE(like);
+    EXPECT_DOUBLE_EQ(like->Cube().at(3), stack->at(3));
+    EXPECT_EQ(like->CompanionNames(), (std::vector<std::string>{"amp33"}));
+    EXPECT_NE(like->Meta().FindPath("roman/meta/wcs"), nullptr);
+    EXPECT_EQ(like->PendingHistory().back(), "stacked; companions dropped: err, dq");
+
+    // Of another shape, and given away: moved, without its GWCS
+    auto smaller = asASDF(asdfLike(ramp<float>({8, 8}), *model, "binned"));
+    ASSERT_TRUE(smaller);
+    EXPECT_EQ(smaller->Cube().Size(1), 8u);
+    EXPECT_EQ(smaller->Meta().FindPath("roman/meta/wcs"), nullptr);
+
+    // A result made with a header of its own keeps the metadata, in the header and in the file
+    EXPECT_EQ(like->Cube().HDU().GetValueForKey("META.INSTRUMENT.NAME"), "WFI");
+    TempFile out(".asdf");
+    like->WriteASDF(out.path());
+    ASDFnode tree = ASDFmanager(out.path()).GetTree();
+    EXPECT_EQ(tree.At("roman/meta/instrument/name").Get<std::string>(), "WFI");
+    EXPECT_EQ(tree.At("roman/meta/exposure/start_time").Tag(), "tag:stsci.edu:asdf/time/time-1.4.0");
+    EXPECT_NE(tree.FindPath("roman/amp33"), nullptr);
+    EXPECT_EQ(tree.FindPath("roman/err"), nullptr);
+}
+
+TEST(ASDFmanager, GetImageWindowReadsOnlyTheWindow)
+{
+    TempFile in(".asdf");
+    writeRoman(in.path());
+    ASDFmanager file(in.path());
+
+    auto cut = file.GetImageWindow("roman.data", {8, 4}, {16, 8});
+    EXPECT_EQ(cut->Size(1), 16u);
+    EXPECT_EQ(cut->Size(2), 8u);
+    EXPECT_DOUBLE_EQ(cut->at(0), dataAt(8, 4));
+    EXPECT_DOUBLE_EQ(cut->at(15 + 7 * 16), dataAt(23, 11));
+    EXPECT_EQ(cut->HDU().GetInt64ValueForKey("NAXIS1"), 16);
+    EXPECT_EQ(cut->HDU().GetInt64ValueForKey("NAXIS2"), 8);
+
+    auto asdf = asASDF(cut);
+    EXPECT_EQ(asdf->Companion("err")->Axes(), (std::vector<size_t>{16, 8}));
+    EXPECT_EQ(asdf->Meta().FindPath("roman/meta/wcs"), nullptr);
+    EXPECT_NE(asdf->PendingHistory().at(0).find("GetImageWindow"), std::string::npos);
+
+    // To the end of the axes
+    EXPECT_EQ(file.GetImageWindow("roman.data", {60})->Size(1), 4u);
+    EXPECT_THROW(file.GetImageWindow("roman.data", {kNX, 0}), FITSexception);
+}
+
+TEST(ASDFmanager, GetImageWindowShiftsTheFITSWCS)
+{
+    TempFile in(".asdf");
+    std::vector<float> data(10 * 8, 1.f);
+    writeTestFile(in.path(),
+        "sci:\n"
+        "  CTYPE1: RA---TAN\n  CTYPE2: DEC--TAN\n  CRPIX1: 10.0\n  CRPIX2: 20.0\n"
+        "  CRVAL1: 10.0\n  CRVAL2: 20.0\n  CDELT1: -0.001\n  CDELT2: 0.001\n"
+        "  data: !core/ndarray-1.1.0 {source: 0, datatype: float32, byteorder: little, shape: [8, 10]}\n",
+        {blockOf(data)});
+    ASDFmanager file(in.path());
+    auto cut = file.GetImageWindow("sci.data", {3, 5}, {4, 2});
+    EXPECT_DOUBLE_EQ(cut->HDU().GetDoubleValueForKey("CRPIX1"), 7.);
+    EXPECT_DOUBLE_EQ(cut->HDU().GetDoubleValueForKey("CRPIX2"), 15.);
+}
+
+// ---------------------------------------------------------------------- Header and tree
+
+TEST(ASDFsync, HeaderChangesReachTheTree)
+{
+    TempFile in(".asdf"), out(".asdf");
+    writeRoman(in.path());
+    ASDFmanager file(in.path());
+    auto image = file.GetImage("roman.data");
+
+    FITShdu& hdu = image->HDU();
+    hdu.ValueForKey("META.EXPOSURE.EXPOSURE_TIME", 200.5);
+    hdu.ValueForKey("META.EXPOSURE.START_TIME", std::string("2028-01-01T00:00:00.000"), fChar);
+    hdu.DeleteKey("META.INSTRUMENT.DETECTOR");
+    hdu.ValueForKey("OBSERVER", std::string("me"), fChar);
+    hdu.ValueForKey("META.EXPOSURE.READS", int32_t(7));
+    asASDF(image)->WriteASDF(out.path());
+
+    ASDFmanager back(out.path());
+    ASDFnode tree = back.GetTree();
+    EXPECT_DOUBLE_EQ(tree.At("roman/meta/exposure/exposure_time").Get<double>(), 200.5);
+    EXPECT_EQ(tree.At("roman/meta/exposure/start_time").Get<std::string>(), "2028-01-01T00:00:00.000");
+    EXPECT_EQ(tree.At("roman/meta/exposure/start_time").Tag(), "tag:stsci.edu:asdf/time/time-1.4.0");
+    EXPECT_EQ(tree.FindPath("roman/meta/instrument/detector"), nullptr);
+    EXPECT_EQ(tree.At("roman/meta/instrument/name").Get<std::string>(), "WFI");
+    EXPECT_EQ(tree.At("roman/OBSERVER").Get<std::string>(), "me");
+    EXPECT_EQ(tree.At("roman/meta/exposure/reads").Get<int>(), 7);
+    for(const char* key : {"BITPIX", "NAXIS", "NAXIS1", "BSCALE", "BZERO", "EXTNAME"})
+        EXPECT_FALSE(tree.At("roman").Contains(key)) << key;
+
+    // Read back, the header is the one that was written
+    auto header = back.GetHeader("roman.data");
+    EXPECT_EQ(header->GetValueForKey("OBSERVER"), "me");
+    EXPECT_EQ(header->GetInt64ValueForKey("META.EXPOSURE.READS"), 7);
+    EXPECT_FALSE(header->Exists("META.INSTRUMENT.DETECTOR"));
+}
+
+TEST(ASDFsync, SetAndRefreshKeepTheHeaderInStep)
+{
+    TempFile in(".asdf");
+    writeRoman(in.path());
+    ASDFmanager file(in.path());
+    auto image = file.GetImage("roman.data");
+    auto asdf = asASDF(image);
+
+    asdf->Set("roman/meta/instrument/name", ASDFnode("NISP"));
+    EXPECT_EQ(image->HDU().GetValueForKey("META.INSTRUMENT.NAME"), "NISP");
+    EXPECT_TRUE(asdf->Erase("roman/meta/exposure/nresultants"));
+    EXPECT_FALSE(image->HDU().Exists("META.EXPOSURE.NRESULTANTS"));
+
+    // A change of the header isn't lost when the tree is read again
+    image->HDU().ValueForKey("OBSERVER", std::string("me"), fChar);
+    asdf->Meta().SetPath("roman/meta/new", 1.5);
+    asdf->RefreshHDU();
+    EXPECT_DOUBLE_EQ(image->HDU().GetDoubleValueForKey("META.NEW"), 1.5);
+    EXPECT_EQ(asdf->Meta().At("roman/OBSERVER").Get<std::string>(), "me");
+    EXPECT_EQ(image->HDU().GetValueForKey("OBSERVER"), "me");
+}
+
+// ---------------------------------------------------------------------- Writing
+
+TEST(ASDFwrite, WhatIsntChangedComesBackAsItWas)
+{
+    TempFile in(".asdf"), out(".asdf");
+    writeRoman(in.path());
+    {
+        ASDFmanager file(in.path());
+        asASDF(file.GetImage("roman.data"))->WriteASDF(out.path());
+    }
+
+    ASDFmanager a(in.path()), b(out.path());
+    expectSameTree(a.GetTree().At("roman"), b.GetTree().At("roman"));
+
+    const ASDFnode entries = b.GetTree().At("history/entries");
+    ASSERT_EQ(entries.Size(), 1u);
+    EXPECT_EQ(entries[0].At("description").Get<std::string>(), "made by the test");
+    EXPECT_EQ(entries[0].At("time").Get<std::string>(), "2020-01-01T00:00:00");
+
+    // Arrays that weren't loaded are copied as they were, still compressed
+    for(const char* name : {"err", "dq", "amp33"})
+    {
+        const auto before = rawBlock(in.path(), std::string("roman/") + name);
+        const auto after  = rawBlock(out.path(), std::string("roman/") + name);
+        EXPECT_FALSE(before.first.empty()) << name;
+        EXPECT_EQ(before.first, after.first) << name;
+        EXPECT_TRUE(before.second == after.second) << name;
+    }
+}
+
+TEST(ASDFwrite, RomanFixturesComeBackAsTheyWere)
+{
+    for(const char* name : {"roman_l2_wcs", "roman_wcs"})
+    {
+        TempFile out(".asdf");
+        ASDFmanager file(fixture(name));
+        const ASDFnode tree = file.GetTree();
+        WriteASDF(tree, out.path());
+
+        ASDFnode back = ASDFmanager(out.path()).GetTree();
+        for(size_t i = 0; i < tree.Size(); i++)
+            if(tree.Keys()[i] != "asdf_library" && tree.Keys()[i] != "history")
+                expectSameTree(tree.Items()[i], back.At(tree.Keys()[i]), std::string(name) + "/" + tree.Keys()[i]);
+    }
+}
+
+TEST(ASDFwrite, CompressionOptions)
+{
+    TempFile in(".asdf");
+    writeRoman(in.path());
+    ASDFmanager file(in.path());
+    auto image = file.GetImage("roman.data");
+    auto asdf = asASDF(image);
+    asdf->Companion("err")->Load();
+
+    auto written = [&](const std::string& compression)
+    {
+        TempFile out(".asdf");
+        ASDFwriteOptions options;
+        options.compression = compression;
+        asdf->WriteASDF(out.path(), options);
+        ASDFnode tree = ASDFmanager(out.path()).GetTree();
+        std::vector<std::string> found;
+        for(const char* name : {"data", "err", "dq", "amp33"})
+            found.push_back(tree.At(std::string("roman/") + name).Array()->Compression());
+        EXPECT_DOUBLE_EQ(tree.At("roman/data").Array()->ValueAt({7, 5}), dataAt(7, 5));
+        EXPECT_FLOAT_EQ(static_cast<float>(tree.At("roman/err").Array()->ValueAt({7, 5})), errAt(7, 5));
+        return found;
+    };
+
+    // Written from memory: data and the loaded err; copied: dq and amp33
+    EXPECT_EQ(written("zlib"), (std::vector<std::string>{"zlib", "zlib", "zlib", "bzp2"}));
+    EXPECT_EQ(written("keep"), (std::vector<std::string>{"", "lz4", "zlib", "bzp2"}));
+    EXPECT_EQ(written(""),     (std::vector<std::string>{"", "", "zlib", "bzp2"}));
+    EXPECT_EQ(written("lz4"),  (std::vector<std::string>{"lz4", "lz4", "zlib", "bzp2"}));
+
+    TempFile bad(".asdf");
+    ASDFwriteOptions options;
+    options.compression = "gzip";
+    EXPECT_THROW(asdf->WriteASDF(bad.path(), options), FITSexception);
+}
+
+TEST(ASDFwrite, OverTheFileItWasReadFrom)
+{
+    TempFile in(".asdf");
+    writeRoman(in.path());
+    std::shared_ptr<FITScube> image;
+    {
+        ASDFmanager file(in.path());
+        image = file.GetImage("roman.data");
+    }
+    image->SetPixelValue(-1.f, size_t(0));
+    EXPECT_THROW(asASDF(image)->WriteASDF(in.path()), FITSexception);
+
+    ASDFwriteOptions options;
+    options.replace = true;
+    asASDF(image)->WriteASDF(in.path(), options);
+
+    ASDFmanager back(in.path());
+    EXPECT_DOUBLE_EQ(back.GetImage("roman.data")->at(0), -1.);
+    EXPECT_DOUBLE_EQ(back.GetImage("roman.data")->at(1), dataAt(1, 0));
+    EXPECT_FLOAT_EQ(static_cast<float>(back.GetArray("roman/err")->ValueAt({2, 3})), errAt(2, 3));
+    EXPECT_DOUBLE_EQ(back.GetArray("roman/dq")->ValueAt({3, 5}), dqAt(3, 5));
+}
+
+TEST(ASDFwrite, HistoryEntriesAreAdded)
+{
+    TempFile in(".asdf"), out(".asdf");
+    writeRoman(in.path());
+    ASDFmanager file(in.path());
+    auto asdf = asASDF(file.GetImage("roman.data"));
+    asdf->AddHistory("calibrated");
+    ASDFwriteOptions options;
+    options.history = "saved by the test";
+    asdf->WriteASDF(out.path(), options);
+
+    const ASDFnode entries = ASDFmanager(out.path()).GetTree().At("history/entries");
+    ASSERT_EQ(entries.Size(), 3u);
+    EXPECT_EQ(entries[0].At("time").Get<std::string>(), "2020-01-01T00:00:00");
+    EXPECT_EQ(entries[1].At("description").Get<std::string>(), "calibrated");
+    EXPECT_EQ(entries[2].At("description").Get<std::string>(), "saved by the test");
+    EXPECT_EQ(entries[2].Tag(), "tag:stsci.edu:asdf/core/history_entry-1.0.0");
+    EXPECT_EQ(entries[2].At("software/name").Get<std::string>(), "asdf2fits");
+    EXPECT_EQ(entries[2].At("time").Get<std::string>().size(), 19u);
+}
+
+TEST(ASDFwrite, TreeBuiltFromScratch)
+{
+    TempFile out(".asdf");
+    ASDFnode tree;
+    tree["meta"]["object"] = "M31";
+    tree["meta"]["exptime"] = 30.;
+    tree["sci"]["data"] = ASDFnode(ASDFarray::FromCube(ramp<float>({6, 4})));
+    WriteASDF(tree, out.path());
+
+    ASDFmanager back(out.path());
+    auto image = back.GetImage("sci.data");
+    EXPECT_DOUBLE_EQ(image->at(5), 6.);
+    EXPECT_EQ(image->HDU().GetValueForKey("META.OBJECT"), "M31");
+    EXPECT_DOUBLE_EQ(image->HDU().GetDoubleValueForKey("META.EXPTIME"), 30.);
+}
+
+TEST(ASDFwrite, AstropyLayoutKeepsItsCards)
+{
+    TempFile in(".asdf"), out(".asdf");
+    auto source = ramp<float>({6, 4});
+    source->HDU().ValueForKey("OBSERVER", std::string("someone"), fChar, "who");
+    fits2asdf(*source, in.path());
+
+    ASDFmanager file(in.path());
+    auto image = file.GetPrimary();
+    ASSERT_TRUE(asASDF(image));
+    EXPECT_TRUE(asASDF(image)->CompanionNames().empty());
+    image->HDU().ValueForKey("OBSERVER", std::string("me"), fChar);
+    image->HDU().ValueForKey("NEWKEY", int32_t(3));
+    asASDF(image->Window(1, 1, 3, 2))->WriteASDF(out.path());
+
+    ASDFmanager back(out.path());
+    auto header = back.GetPrimaryHeader();
+    EXPECT_EQ(header->GetValueForKey("OBSERVER"), "me");
+    EXPECT_EQ(header->GetInt64ValueForKey("NEWKEY"), 3);
+    EXPECT_EQ(header->GetInt64ValueForKey("NAXIS1"), 3);
+    EXPECT_EQ(header->GetInt64ValueForKey("NAXIS2"), 2);
+    EXPECT_DOUBLE_EQ(back.GetPrimary()->at(0), source->at(1 * 6 + 1));
+
+    ASDFnode tree = back.GetTree();
+    EXPECT_TRUE(tree.At("fits").HasTag("/fits/fits-"));
+    EXPECT_EQ(tree.At("fits/0/header/0/0").Get<std::string>(), "SIMPLE");
+}
+
+TEST(ASDFwrite, Fits2asdfWritesAnASDFImageInItsOwnLayout)
+{
+    TempFile in(".asdf"), out(".asdf");
+    writeRoman(in.path());
+    ASDFmanager file(in.path());
+    fits2asdf(*file.GetImage("roman.data"), out.path());
+    ASDFnode tree = ASDFmanager(out.path()).GetTree();
+    EXPECT_EQ(tree.FindPath("fits"), nullptr);
+    EXPECT_EQ(tree.At("roman/meta/instrument/name").Get<std::string>(), "WFI");
+}
+
+// ---------------------------------------------------------------------- Array handles
+
+TEST(ASDFarray, LoadReadReleaseSetAndClone)
+{
+    TempFile in(".asdf");
+    writeRoman(in.path());
+    ASDFmanager file(in.path());
+    auto err = file.GetArray("roman/err");
+    EXPECT_FALSE(err->IsLoaded());
+    EXPECT_THROW(file.GetArray("roman/meta"), FITSexception);
+    EXPECT_THROW(file.GetArray("roman/none"), FITSexception);
+
+    auto pixels = err->Load();
+    EXPECT_TRUE(err->IsLoaded());
+    EXPECT_EQ(err->Load(), pixels);
+
+    auto tile = err->Read({1, 2}, {3, 4});
+    EXPECT_EQ(tile->Size(1), 3u);
+    EXPECT_EQ(tile->Size(2), 4u);
+    EXPECT_FLOAT_EQ(static_cast<float>(tile->at(0)), errAt(1, 2));
+    EXPECT_THROW(err->Read({kNX}), FITSexception);
+
+    auto copy = err->Clone();
+    EXPECT_TRUE(copy->IsLoaded());
+    EXPECT_NE(copy->Load(), pixels);
+    EXPECT_TRUE(err->Release());
+    EXPECT_FALSE(err->IsLoaded());
+
+    auto window = err->Window({2, 3}, {4, 5})->Window({1, 1}, {2, 2});
+    EXPECT_EQ(window->Axes(), (std::vector<size_t>{2, 2}));
+    EXPECT_FLOAT_EQ(static_cast<float>(window->ValueAt({1, 1})), errAt(4, 5));
+    EXPECT_FALSE(window->IsLoaded());
+
+    // The array outlives its manager
+    file.Close();
+    EXPECT_FLOAT_EQ(static_cast<float>(window->Load()->at(0)), errAt(3, 4));
+
+    auto memory = ASDFarray::FromCube(ramp<int16_t>({5, 4}));
+    EXPECT_FALSE(memory->IsInFile());
+    EXPECT_EQ(memory->DataType(), "int16");
+    EXPECT_EQ(memory->Axes(), (std::vector<size_t>{5, 4}));
+    EXPECT_EQ(memory->Bytes(), 40u);
+    EXPECT_FALSE(memory->Release());
+    EXPECT_TRUE(memory->IsLoaded());
+}
+
+// libasdf writes over a file without truncating it: a longer file replaced by a shorter one kept its end,
+// and its block index, behind.
+TEST(Write, ReplacingALongerFileLeavesNothingOfIt)
+{
+    TempFile path(".asdf"), fresh(".asdf");
+    fits2asdf(*ramp<double>({200, 200}), path.path());
+    auto small = ramp<float>({4, 3});
+    fits2asdf(*small, path.path(), true);
+    fits2asdf(*small, fresh.path());
+
+    EXPECT_EQ(std::filesystem::file_size(path.path()), std::filesystem::file_size(fresh.path()));
+    ASDFmanager back(path.path());
+    EXPECT_EQ(back.GetPrimary()->Nelements(), 12u);
+}
+
+TEST(ASDFmanager, LargeCompressedArraysCanBeDecompressedToDisk)
+{
+    TempFile in(".asdf");
+    writeRoman(in.path());
+    ASDFreadOptions options;
+    options.maxMemoryBytes = 1024;      // smaller than every array: all go through a temporary file
+    options.tmpDir = ASDF2FITS_TEST_DIR;    // created by the TempFile above
+    ASDFmanager file(in.path(), options);
+
+    auto dq = file.GetArray("roman/dq");
+    EXPECT_DOUBLE_EQ(dq->ValueAt({3, 5}), dqAt(3, 5));
+    auto err = file.GetArray("roman/err")->Load();
+    EXPECT_FLOAT_EQ(static_cast<float>(err->at(7 * kNX + 9)), errAt(9, 7));
+    EXPECT_DOUBLE_EQ(file.GetArray("roman/amp33")->ValueAt({2, 40}), amp33At(2, 40));
+}
+
+// ---------------------------------------------------------------------- Multi-HDU file, libasdf on the other side
+//
+// The file of writeMultiHDU() is made with the libasdf API alone: one HDU per pixel type, of 1 to 4 axes, little
+// or big endian, compressed or not, plus a mapping whose image has companions. ASDFcube must read exactly what
+// was put in it, and what ASDFcube writes must read back, with libasdf alone, as expected.
+
+template<typename T> class LibasdfMultiHDU : public testing::Test {};
+TYPED_TEST_SUITE(LibasdfMultiHDU, PixelTypes);
+
+TYPED_TEST(LibasdfMultiHDU, ASDFcubeReadsWhatLibasdfWrote)
+{
+    using T = TypeParam;
+    const ArraySpec spec = specOf<T>();
+    const std::string name = spec.group + ".data";
+    TempFile path(".asdf");
+    ASSERT_NO_FATAL_FAILURE(writeMultiHDU(path.path()));
+
+    ASDFmanager file(path.path());
+    ASSERT_EQ(file.NumberOfHeader(), kMultiHDUs);
+
+    auto cube = file.GetImage(name);
+    auto image = std::dynamic_pointer_cast<ASDFimg<T>>(cube);
+    ASSERT_NE(image, nullptr) << name << " isn't an ASDFimg of its type";
+    EXPECT_EQ(image->ImagePath(), spec.group + "/data");
+    EXPECT_TRUE(image->CompanionNames().empty());
+
+    // Axes: NAXIS1 is the last length of the shape
+    const std::vector<size_t> axes = axesOf(spec.shape);
+    ASSERT_EQ(cube->GetDimension(), axes.size());
+    for(size_t k = 0; k < axes.size(); k++)
+        EXPECT_EQ(cube->Size(k + 1), axes[k]) << "NAXIS" << k + 1;
+
+    // Pixels: exactly the values written, whatever the byte order and the compression
+    const std::vector<T> expected = pixelsOf<T>(spec);
+    const std::valarray<T>* pixels = cube->template GetData<T>();
+    ASSERT_NE(pixels, nullptr);
+    ASSERT_EQ(pixels->size(), expected.size());
+    for(size_t i = 0; i < expected.size(); i++)
+        ASSERT_EQ((*pixels)[i], expected[i]) << name << " [" << i << "]";
+    EXPECT_EQ(cube->GetBitPerPixel(), FITSimg<T>(std::vector<size_t>{1}).GetBitPerPixel());
+
+    // Header: structure, and the scalars of the mapping of the image
+    auto header = file.GetHeader(name);
+    EXPECT_EQ(header->GetValueForKey("EXTNAME"), name);
+    EXPECT_EQ(header->GetInt32ValueForKey("NAXIS"), static_cast<int32_t>(axes.size()));
+    for(size_t k = 0; k < axes.size(); k++)
+        EXPECT_EQ(header->GetUInt64ValueForKey("NAXIS" + std::to_string(k + 1)), axes[k]);
+    EXPECT_EQ(header->GetValueForKey("LABEL"), spec.group + " image");
+    EXPECT_EQ(header->GetInt64ValueForKey("RANK"), static_cast<int64_t>(axes.size()));
+    EXPECT_EQ(cube->HDU().GetValueForKey("LABEL"), spec.group + " image");
+
+    // Tree: the array as described in the file
+    const ASDFnode tree = file.GetTree();
+    auto array = tree.At(spec.group + "/data").Array();
+    ASSERT_TRUE(array);
+    EXPECT_EQ(array->DataType(), asdfNameOf<T>());
+    EXPECT_EQ(array->Shape(), spec.shape);
+    EXPECT_EQ(array->Axes(), axes);
+    EXPECT_EQ(array->Compression(), spec.compression);
+}
+
+TEST(LibasdfMultiHDU, ASDFcubeReadsTheFileLevelContent)
+{
+    TempFile path(".asdf");
+    ASSERT_NO_FATAL_FAILURE(writeMultiHDU(path.path()));
+    ASDFmanager file(path.path());
+    ASSERT_EQ(file.NumberOfHeader(), kMultiHDUs);
+
+    // Every ndarray is an HDU, named after its path
+    std::vector<std::string> names;
+    for(int i = 1; i <= file.NumberOfHeader(); i++)
+        names.push_back(file.GetHeaderAtIndex(i)->GetValueForKey("EXTNAME"));
+    std::vector<std::string> expected = {"sci.data", "sci.err", "sci.dq"};
+    forEachPixelType([&]<typename T>() { expected.push_back(specOf<T>().group + ".data"); });
+    std::sort(names.begin(), names.end());
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(names, expected);
+
+    // The scalars of the root are keywords of the primary HDU
+    auto primary = file.GetPrimaryHeader();
+    EXPECT_EQ(primary->GetValueForKey("OBJECT"), "NGC 1300");
+    EXPECT_DOUBLE_EQ(primary->GetDoubleValueForKey("EXPTIME"), 87.5);
+    EXPECT_EQ(primary->GetInt64ValueForKey("NCOMBINE"), -12);
+    EXPECT_TRUE(primary->GetBoolValueForKey("CALIBRATED"));
+
+    // The image of sci has its siblings as companions, read only when asked
+    auto sci = asASDF(file.GetImage("sci.data"));
+    ASSERT_TRUE(sci);
+    EXPECT_EQ(sci->CompanionNames(), (std::vector<std::string>{"err", "dq"}));
+    EXPECT_EQ(sci->Cube().HDU().GetValueForKey("TELESCOPE"), "Euclid");
+    EXPECT_EQ(sci->Cube().Size(1), kSciNX);
+    EXPECT_EQ(sci->Cube().Size(2), kSciNY);
+    EXPECT_DOUBLE_EQ(sci->Cube().at(3 * kSciNX + 5), sciDataAt(5, 3));
+
+    auto err = sci->Companion("err");
+    ASSERT_TRUE(err);
+    EXPECT_FALSE(err->IsLoaded());
+    EXPECT_EQ(err->Compression(), "lz4");
+    EXPECT_EQ(err->DataType(), "float32");
+    EXPECT_FLOAT_EQ(static_cast<float>(err->ValueAt({5, 3})), sciErrAt(5, 3));     // big endian, compressed
+
+    EXPECT_EQ(sci->MaskFromDQ(1), kSciNY);     // column x = 2
+    EXPECT_EQ(sci->MaskFromDQ(2), kSciNX);     // row y = 4
+    EXPECT_TRUE(sci->Cube().Masked(size_t(4 * kSciNX + 7)));
+    EXPECT_FALSE(sci->Cube().Masked(size_t(3 * kSciNX + 5)));
+
+    // Companions are HDUs of their own too
+    auto dq = file.GetImage("sci.dq");
+    ASSERT_NE(dq->GetData<uint16_t>(), nullptr);
+    EXPECT_EQ(dq->UShortValueAtPixel(size_t(4 * kSciNX + 2)), 3);
+    auto errImage = file.GetImage("sci.err");
+    ASSERT_NE(errImage->GetData<float>(), nullptr);
+    for(size_t y = 0; y < kSciNY; y++)
+        for(size_t x = 0; x < kSciNX; x++)
+            ASSERT_EQ(errImage->FloatValueAtPixel(y * kSciNX + x), sciErrAt(x, y)) << x << "," << y;
+}
+
+TYPED_TEST(LibasdfMultiHDU, LibasdfReadsWhatASDFcubeWrote)
+{
+    using T = TypeParam;
+    const ArraySpec spec = specOf<T>();
+    TempFile in(".asdf"), out(".asdf");
+    ASSERT_NO_FATAL_FAILURE(writeMultiHDU(in.path()));
+
+    // Change one pixel in three, and a keyword
+    std::vector<T> expected = pixelsOf<T>(spec);
+    const std::vector<T> changed = pixelsOf<T>(spec, spec.salt + 50);
+    {
+        ASDFmanager file(in.path());
+        auto image = std::dynamic_pointer_cast<ASDFimg<T>>(file.GetImage(spec.group + ".data"));
+        ASSERT_NE(image, nullptr);
+        std::valarray<T>& pixels = *image->template GetData<T>();
+        for(size_t i = 2; i < pixels.size(); i += 3)
+            pixels[i] = expected[i] = changed[i];
+        image->HDU().ValueForKey("LABEL", std::string("changed"), fChar);
+        image->WriteASDF(out.path());
+    }
+
+    // The image, as libasdf reads it: type, shape, compression kept, pixels
+    LibasdfArray back;
+    ASSERT_NO_FATAL_FAILURE(readNdarray(out.path(), spec.group + "/data", back));
+    EXPECT_EQ(back.type, asdfTypeOf<T>());
+    EXPECT_EQ(back.shape, spec.shape);
+    EXPECT_EQ(back.compression, spec.compression);
+    EXPECT_TRUE(back.values<T>() == expected);
+
+    // The arrays of the other HDUs, still compressed, come back as they were
+    for(const char* other : {"sci/err", "sci/dq"})
+    {
+        const auto before = rawBlock(in.path(), other);
+        const auto after  = rawBlock(out.path(), other);
+        EXPECT_EQ(before.first, after.first) << other;
+        EXPECT_TRUE(before.second == after.second) << other;
+    }
+    LibasdfArray err;
+    ASSERT_NO_FATAL_FAILURE(readNdarray(out.path(), "sci/err", err));
+    EXPECT_EQ(err.type, ASDF_DATATYPE_FLOAT32);
+    EXPECT_FLOAT_EQ(err.values<float>().at(3 * kSciNX + 5), sciErrAt(5, 3));
+
+    // The scalars: the keyword changed, the others as they were
+    asdf_file_t* file = asdf_open_file(out.path().c_str(), "r");
+    ASSERT_NE(file, nullptr);
+    const char* label = nullptr;
+    const char* object = nullptr;
+    const char* telescope = nullptr;
+    double exptime = 0.;
+    int64_t ncombine = 0, rank = 0;
+    bool calibrated = false;
+    EXPECT_EQ(asdf_get_string0(file, (spec.group + "/label").c_str(), &label), ASDF_VALUE_OK);
+    EXPECT_STREQ(label, "changed");
+    EXPECT_EQ(asdf_get_int64(file, (spec.group + "/rank").c_str(), &rank), ASDF_VALUE_OK);
+    EXPECT_EQ(rank, static_cast<int64_t>(spec.shape.size()));
+    EXPECT_EQ(asdf_get_string0(file, "object", &object), ASDF_VALUE_OK);
+    EXPECT_STREQ(object, "NGC 1300");
+    EXPECT_EQ(asdf_get_double(file, "exptime", &exptime), ASDF_VALUE_OK);
+    EXPECT_DOUBLE_EQ(exptime, 87.5);
+    EXPECT_EQ(asdf_get_int64(file, "ncombine", &ncombine), ASDF_VALUE_OK);
+    EXPECT_EQ(ncombine, -12);
+    EXPECT_EQ(asdf_get_bool(file, "calibrated", &calibrated), ASDF_VALUE_OK);
+    EXPECT_TRUE(calibrated);
+    EXPECT_EQ(asdf_get_string0(file, "sci/telescope", &telescope), ASDF_VALUE_OK);
+    EXPECT_STREQ(telescope, "Euclid");
+    asdf_close(file);
+
+    // No HDU was lost
+    EXPECT_EQ(ASDFmanager(out.path()).NumberOfHeader(), kMultiHDUs);
+}
+
+TEST(LibasdfMultiHDU, LibasdfReadsCutImagesWrittenByASDFcube)
+{
+    TempFile in(".asdf"), window(".asdf"), layer(".asdf");
+    ASSERT_NO_FATAL_FAILURE(writeMultiHDU(in.path()));
+    const ArraySpec u16 = specOf<uint16_t>();      // shape {7, 6}: NAXIS1 = 6, NAXIS2 = 7
+    const ArraySpec i16 = specOf<int16_t>();       // shape {3, 4, 5}
+    const std::vector<uint16_t> u16Pixels = pixelsOf<uint16_t>(u16);
+    const std::vector<int16_t>  i16Pixels = pixelsOf<int16_t>(i16);
+    {
+        ASDFmanager file(in.path());
+        asASDF(file.GetImage("u16.data")->Window(1, 2, 4, 3))->WriteASDF(window.path());
+        asASDF(file.GetImage("i16.data")->Layer(1))->WriteASDF(layer.path());
+    }
+
+    LibasdfArray cut;
+    ASSERT_NO_FATAL_FAILURE(readNdarray(window.path(), "u16/data", cut));
+    EXPECT_EQ(cut.type, ASDF_DATATYPE_UINT16);
+    ASSERT_EQ(cut.shape, (std::vector<uint64_t>{3, 4}));
+    EXPECT_EQ(cut.compression, "lz4");
+    const std::vector<uint16_t> cutPixels = cut.values<uint16_t>();
+    ASSERT_EQ(cutPixels.size(), 12u);
+    for(size_t y = 0; y < 3; y++)
+        for(size_t x = 0; x < 4; x++)
+            EXPECT_EQ(cutPixels[y * 4 + x], u16Pixels[(y + 2) * 6 + (x + 1)]) << x << "," << y;
+
+    LibasdfArray plane;
+    ASSERT_NO_FATAL_FAILURE(readNdarray(layer.path(), "i16/data", plane));
+    EXPECT_EQ(plane.type, ASDF_DATATYPE_INT16);
+    ASSERT_EQ(plane.shape, (std::vector<uint64_t>{4, 5}));
+    EXPECT_EQ(plane.compression, "");
+    const std::vector<int16_t> planePixels = plane.values<int16_t>();
+    ASSERT_EQ(planePixels.size(), 20u);
+    for(size_t i = 0; i < 20; i++)
+        EXPECT_EQ(planePixels[i], i16Pixels[20 + i]) << i;
+
+    // The other HDUs are untouched
+    LibasdfArray other;
+    ASSERT_NO_FATAL_FAILURE(readNdarray(window.path(), "f64/data", other));
+    EXPECT_EQ(other.shape, specOf<double>().shape);
+    EXPECT_TRUE(other.values<double>() == pixelsOf<double>(specOf<double>()));
+}
+
+TEST(LibasdfMultiHDU, LibasdfReadsATreeOfAllPixelTypesWrittenByASDF2fits)
+{
+    TempFile out(".asdf");
+    ASDFnode tree;
+    tree["object"] = "M33";
+    forEachPixelType([&]<typename T>()
+    {
+        const ArraySpec spec = specOf<T>();
+        auto cube = std::make_shared<FITSimg<T>>(axesOf(spec.shape));
+        std::valarray<T>& pixels = *cube->template GetData<T>();
+        const std::vector<T> values = pixelsOf<T>(spec);
+        for(size_t i = 0; i < values.size(); i++)
+            pixels[i] = values[i];
+        tree[spec.group]["data"] = ASDFnode(ASDFarray::FromCube(cube));
+        tree[spec.group]["label"] = spec.group + " image";
+    });
+    ASDFwriteOptions options;
+    options.compression = "zlib";
+    WriteASDF(tree, out.path(), options);
+
+    forEachPixelType([&]<typename T>()
+    {
+        const ArraySpec spec = specOf<T>();
+        LibasdfArray back;
+        ASSERT_NO_FATAL_FAILURE(readNdarray(out.path(), spec.group + "/data", back));
+        EXPECT_EQ(back.type, asdfTypeOf<T>()) << spec.group;
+        EXPECT_EQ(back.shape, spec.shape) << spec.group;
+        EXPECT_EQ(back.compression, "zlib") << spec.group;
+        EXPECT_TRUE(back.values<T>() == pixelsOf<T>(spec)) << spec.group;
+    });
+
+    asdf_file_t* file = asdf_open_file(out.path().c_str(), "r");
+    ASSERT_NE(file, nullptr);
+    const char* object = nullptr;
+    const char* label = nullptr;
+    EXPECT_EQ(asdf_get_string0(file, "object", &object), ASDF_VALUE_OK);
+    EXPECT_STREQ(object, "M33");
+    EXPECT_EQ(asdf_get_string0(file, "f32/label", &label), ASDF_VALUE_OK);
+    EXPECT_STREQ(label, "f32 image");
+    asdf_close(file);
+}
+
+// ---------------------------------------------------------------------- Known bugs of libasdf, not patched
+//
+// Each test checks that a bug of libasdf is still there. When one fails, the libasdf now built has the bug
+// fixed: remove the workaround it names, the test itself, and its line in LIBASDF_KNOWN_BUGS (CMakeLists.txt).
+
+// asdf_set_*(file, "a/b") fails when the mapping "a" is already in the tree: asdf_node_materialize_path
+// (libasdf/src/value.c) appends the existing "a" to its parent again, and reports that as out of memory,
+// without an error message. The key is lost. Workaround: writeMultiHDU() builds each mapping whole.
+TEST(LibasdfKnownBugs, SetUnderAnExistingMapping)
+{
+    asdf_file_t* file = asdf_open_mem(nullptr, 0);
+    ASSERT_NE(file, nullptr);
+    EXPECT_EQ(asdf_set_string0(file, "a/x", "one"), ASDF_VALUE_OK);     // creates a
+    const asdf_value_err_t second = asdf_set_string0(file, "a/y", "two");
+    asdf_close(file);
+
+    EXPECT_EQ(second, ASDF_VALUE_ERR_OOM)
+        << "libasdf " LIBASDF_VERSION " now adds a key to an existing mapping (returned " << second << "): the bug is "
+           "fixed. writeMultiHDU() may use asdf_set_*(file, \"group/key\") again; remove this test, the comment above "
+           "setNdarray() and the entry of LIBASDF_KNOWN_BUGS in CMakeLists.txt.";
 }
