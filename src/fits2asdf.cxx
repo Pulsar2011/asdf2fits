@@ -19,10 +19,12 @@
 #include <mutex>
 #include <vector>
 
+#include "ASDFcube.h"
 #include "ASDFheader.h"
 #include "ASDFhandle.h"
 #include "ASDFimage.h"
 #include "ASDFtable.h"
+#include "ASDFwrite.h"
 
 namespace DSL
 {
@@ -177,8 +179,8 @@ namespace DSL
             if(err != ASDF_VALUE_OK)
                 throw FITSexception(WRITE_ERROR, kWho, "write", lastError(file.get()));
 
-            if(asdf_write_to_file(file.get(), path.c_str()) != 0)
-                throw FITSexception(FILE_NOT_CREATED, kWho, "write", "can't write "+path+": "+lastError(file.get()));
+            // Not asdf_write_to_file() on the path: it doesn't truncate a longer file already there
+            writeReplacing(file.get(), path);
         }
 
         /**
@@ -210,6 +212,15 @@ namespace DSL
 
     void fits2asdf(const FITScube& cube, const std::string& path, bool replace)
     {
+        // An image read from an ASDF file is written in the layout of its file, with its whole tree
+        if(const ASDFcube* asdf = dynamic_cast<const ASDFcube*>(&cube))
+        {
+            ASDFwriteOptions options;
+            options.replace = replace;
+            asdf->WriteASDF(path, options);
+            return;
+        }
+
         HDUList list;
         list.hdus.push_back(cubeHDU(cube));
         writeFile(list, path, replace);

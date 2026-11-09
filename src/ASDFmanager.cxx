@@ -22,7 +22,10 @@
 #include "ASDFheader.h"
 #include "ASDFhandle.h"
 #include "ASDFimage.h"
+#include "ASDFsource.h"
+#include "ASDFstate.h"
 #include "ASDFtable.h"
+#include "ASDFtree.h"
 
 namespace DSL
 {
@@ -60,6 +63,12 @@ namespace DSL
             std::vector<ColumnSpec> columns;    //!< Layout of a table's columns
             uint64_t rows = 0;                  //!< Number of rows of a table
             bool structured = false;            //!< The table's columns all live in @c ndarray
+
+            std::string dataPath;               //!< Path of the data in the tree
+            std::string parentPath;             //!< Path of the node holding the data; empty at the root
+            std::string keywordsPath;           //!< Path of the mapping whose scalars are keywords of the HDU
+            bool hasKeywords = false;           //!< @c keywordsPath is set; false for data at the root
+            std::string cardsPath;              //!< Astropy FITS layout: path of the card list
         };
 
         /**
@@ -149,23 +158,35 @@ namespace DSL
         }
     }
 
-    /** @brief Private state of DSL::ASDFmanager: the open file and its list of HDUs. */
+    /** @brief Private state of DSL::ASDFmanager: the open file, its tree and its list of HDUs. */
     struct ASDFmanager::Impl
     {
-        mutable std::mutex mtx;         //!< Taken by every public method
-        FilePtr file;                   //!< The open file; null once closed
-        std::string path;               //!< Path of the file, for messages
-        std::vector<HDUEntry> hdus;     //!< All HDUs, the primary one first
-        bool fitsLayout = false;        //!< The file holds the astropy FITS layout
-        FITShdu rootKeywords;           //!< Keywords from the scalars at the root of the tree
+        mutable std::mutex mtx;                 //!< Taken by every public method; before the file's own mutex
+        std::shared_ptr<FileSource> source;     //!< The open file, shared with the ndarray handles; null once closed
+        std::string path;                       //!< Path of the file, for messages
+        ASDFnode tree;                          //!< The whole tree; its ndarray handles keep the file open
+        std::vector<HDUEntry> hdus;             //!< All HDUs, the primary one first
+        bool fitsLayout = false;                //!< The file holds the astropy FITS layout
+        FITShdu rootKeywords;                   //!< Keywords from the scalars at the root of the tree
+
+        /** @brief Release the ndarrays, which use the file, while nothing else does. */
+        ~Impl()
+        {
+            if(source)
+            {
+                std::lock_guard<std::mutex> lock(source->mtx);
+                hdus.clear();
+            }
+        }
 
         /**
          * @brief Add every HDU of a value in the astropy FITS layout.
          * @details An HDU is named after EXTNAME, otherwise PRIMARY for the first and HDUn for the others.
-         * @param value Sequence of {header, data} mappings; a non-sequence or non-mapping entry is skipped.
+         * @param value    Sequence of {header, data} mappings; a non-sequence or non-mapping entry is skipped.
+         * @param nodePath Path of the value in the tree.
          * @throws FITSexception As describeData().
          */
-        void addFitsLayout(asdf_value_t* value)
+        void addFitsLayout(asdf_value_t* value, const std::string& nodePath)
         {
             fitsLayout = true;
             asdf_sequence_t* list = nullptr;
@@ -180,9 +201,11 @@ namespace DSL
                     continue;
 
                 HDUEntry entry;
-                ValuePtr cards(asdf_mapping_get(node, "header"));
-                if(cards)
-                    readCards(cards.get(), entry.header);
+                entry.parentPath = ASDFnode::ChildPath(nodePath, std::to_string(it->index));
+                entry.cardsPath  = ASDFnode::ChildPath(entry.parentPath, "header");
+                entry.dataPath   = ASDFnode::ChildPath(entry.parentPath, "data");
+                if(const ASDFnode* cards = tree.FindPath(entry.cardsPath))
+                    readCards(*cards, entry.header);
 
                 if(entry.header.Exists("EXTNAME"))
                     entry.name = entry.header.GetValueForKey("EXTNAME");
@@ -200,18 +223,26 @@ namespace DSL
         /**
          * @brief Add one HDU for a table or an ndarray found in a tree of another layout.
          * @param value    Data of the HDU.
-         * @param path     Tree path, used as the name of the HDU and, unless it is PRIMARY, as EXTNAME.
-         * @param siblings Mapping containing the data, whose scalars become keywords; may be null.
+         * @param name     Tree path joined by dots, used as the name of the HDU and, unless it is PRIMARY, as EXTNAME.
+         * @param nodePath Path of the value in the tree.
+         * @param siblings Path of the mapping containing the data, whose scalars become keywords; null at the root.
          * @throws FITSexception As describeData().
          */
-        void addData(asdf_value_t* value, const std::string& path, asdf_value_t* siblings)
+        void addData(asdf_value_t* value, const std::string& name, const std::string& nodePath, const std::string* siblings)
         {
             HDUEntry entry;
-            entry.name = path;
+            entry.name = name;
+            entry.dataPath = nodePath;
+            entry.parentPath = ASDFnode::ParentPath(nodePath);
+            entry.hasKeywords = siblings != nullptr;
             if(siblings)
-                readTreeKeywords(siblings, std::string(), entry.header);
-            if(lower(path) != "primary")
-                entry.header.ValueForKey("EXTNAME", path, fChar);
+            {
+                entry.keywordsPath = *siblings;
+                if(const ASDFnode* mapping = tree.FindPath(*siblings))
+                    readTreeKeywords(*mapping, std::string(), *siblings, entry.header);
+            }
+            if(lower(name) != "primary")
+                entry.header.ValueForKey("EXTNAME", name, fChar);
             describeData(value, entry);
             hdus.push_back(std::move(entry));
         }
@@ -220,26 +251,28 @@ namespace DSL
          * @brief Find the HDUs below a value, recursively.
          * @details GWCS objects and transforms are skipped, as are asdf_library and history at the root.
          * @param value    Value to search.
-         * @param path     Tree path of the value, its parts joined by dots; empty at the root.
-         * @param siblings Mapping containing @p value, whose scalars become keywords if @p value is data; null at the root and for its direct entries.
+         * @param name     Tree path of the value, its parts joined by dots; empty at the root.
+         * @param nodePath Path of the value in the tree.
+         * @param siblings Path of the mapping containing @p value, whose scalars become keywords if @p value is
+         * data; null at the root and for its direct entries.
          * @throws FITSexception As describeData().
          */
-        void walk(asdf_value_t* value, const std::string& path, asdf_value_t* siblings)
+        void walk(asdf_value_t* value, const std::string& name, const std::string& nodePath, const std::string* siblings)
         {
             if(isOpaqueValue(value))
                 return;
             if(hasTag(value, "/fits/fits-"))
             {
-                addFitsLayout(value);
+                addFitsLayout(value, nodePath);
                 return;
             }
             if(isDataValue(value))
             {
-                addData(value, path, siblings);
+                addData(value, name, nodePath, siblings);
                 return;
             }
 
-            const std::string prefix = path.empty() ? std::string() : path + ".";
+            const std::string prefix = name.empty() ? std::string() : name + ".";
             asdf_mapping_t* mapping = nullptr;
             asdf_sequence_t* sequence = nullptr;
             if(asdf_value_as_mapping(value, &mapping) == ASDF_VALUE_OK)
@@ -247,10 +280,11 @@ namespace DSL
                 asdf_mapping_iter_t* it = asdf_mapping_iter_init(mapping);
                 while(asdf_mapping_iter_next(&it))
                 {
-                    if(path.empty() && (std::string(it->key) == "asdf_library" || std::string(it->key) == "history"))
+                    const std::string key(it->key);
+                    if(name.empty() && (key == "asdf_library" || key == "history"))
                         continue;
                     if(holdsData(it->value))
-                        walk(it->value, prefix + it->key, path.empty() ? nullptr : value);
+                        walk(it->value, prefix + key, ASDFnode::ChildPath(nodePath, key), name.empty() ? nullptr : &nodePath);
                 }
             }
             else if(asdf_value_as_sequence(value, &sequence) == ASDF_VALUE_OK)
@@ -258,50 +292,24 @@ namespace DSL
                 asdf_sequence_iter_t* it = asdf_sequence_iter_init(sequence);
                 while(asdf_sequence_iter_next(&it))
                     if(holdsData(it->value))
-                        walk(it->value, prefix + std::to_string(it->index), siblings);
+                        walk(it->value, prefix + std::to_string(it->index), ASDFnode::ChildPath(nodePath, std::to_string(it->index)), siblings);
             }
         }
 
         /**
-         * @brief Turn the root of the tree into keywords, in @c rootKeywords.
-         * @details Entries holding data, GWCS objects, transforms, asdf_library and history are skipped.
-         * @param root Root of the tree; ignored if it isn't a mapping.
-         */
-        void collectRootKeywords(asdf_value_t* root)
-        {
-            asdf_mapping_t* mapping = nullptr;
-            if(asdf_value_as_mapping(root, &mapping) != ASDF_VALUE_OK)
-                return;
-
-            asdf_mapping_iter_t* it = asdf_mapping_iter_init(mapping);
-            while(asdf_mapping_iter_next(&it))
-            {
-                const std::string key(it->key);
-                if(key == "asdf_library" || key == "history" || holdsData(it->value) || isOpaqueValue(it->value))
-                    continue;
-
-                std::string upper(key);
-                std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c){ return std::toupper(c); });
-                if(asdf_value_is_mapping(it->value))
-                    readTreeKeywords(it->value, upper, rootKeywords);
-                else
-                    readScalar(it->value, upper, rootKeywords);
-            }
-        }
-
-        /**
-         * @brief List the HDUs of the file and put the primary one first.
+         * @brief Read the tree, list the HDUs of the file and put the primary one first.
          * @details Except in the astropy FITS layout, a tree without data gets an empty PRIMARY HDU and the
          * root keywords go to the first HDU.
          * @throws FITSexception FILE_NOT_OPENED if the file has no tree, or as describeData().
          */
         void discover()
         {
-            ValuePtr root(asdf_get_value(file.get(), ""));
+            ValuePtr root(asdf_get_value(source->file.get(), ""));
             if(!root)
-                throw FITSexception(FILE_NOT_OPENED, kWho, "open", "no ASDF tree in "+path+": "+lastError(file.get()));
+                throw FITSexception(FILE_NOT_OPENED, kWho, "open", "no ASDF tree in "+path+": "+lastError(source->file.get()));
 
-            walk(root.get(), std::string(), nullptr);
+            tree = readTree(root.get(), source, std::string());
+            walk(root.get(), std::string(), std::string(), nullptr);
 
             // The primary HDU comes first, as in a FITS file
             auto primary = std::find_if(hdus.begin(), hdus.end(), [](const HDUEntry& e){ return lower(e.name) == "primary"; });
@@ -320,7 +328,7 @@ namespace DSL
                 hdus.push_back(std::move(entry));
             }
 
-            collectRootKeywords(root.get());
+            readRootKeywords(tree, rootKeywords);
             hdus.front().header.Import(rootKeywords);
         }
 
@@ -331,7 +339,7 @@ namespace DSL
          */
         void requireOpen(const char* what) const
         {
-            if(!file)
+            if(!source)
                 throw FITSexception(FILE_NOT_OPENED, kWho, what, "the file is closed");
         }
 
@@ -367,18 +375,36 @@ namespace DSL
         }
 
         /**
-         * @brief Read the image of an HDU.
+         * @brief Read the image of an HDU, or part of it, with the tree of the file.
          * @param entry HDU to read.
-         * @return The image.
+         * @param tile  Part to read; the whole image by default.
+         * @return The image, an ASDFimg\<T\>.
          * @throws FITSexception NOT_IMAGE if the HDU is a table or empty, or as readImage().
          */
-        std::shared_ptr<FITScube> loadImage(HDUEntry& entry)
+        std::shared_ptr<FITScube> loadImage(HDUEntry& entry, const Tile& tile = {})
         {
             if(entry.kind == HDUEntry::table)
                 throw FITSexception(NOT_IMAGE, kWho, "GetImage", "HDU '"+entry.name+"' of "+path+" is a table");
             if(entry.kind == HDUEntry::empty)
                 throw FITSexception(NOT_IMAGE, kWho, "GetImage", "HDU '"+entry.name+"' of "+path+" holds no data");
-            return readImage(entry.ndarray.get(), entry.header);
+
+            std::shared_ptr<FITScube> cube;
+            {
+                std::lock_guard<std::mutex> lock(source->mtx);
+                cube = readImage(entry.ndarray.get(), entry.header, tile, true);
+            }
+
+            ImageState state;
+            state.tree = tree.Clone();
+            state.imagePath = entry.dataPath;
+            state.companions = !fitsLayout && !entry.parentPath.empty();
+            state.link.cardsPath = entry.cardsPath;
+            state.link.keywordsPath = entry.keywordsPath;
+            state.link.hasKeywords = entry.hasKeywords;
+            state.link.rootKeywords = !fitsLayout && &entry == &hdus.front();
+            state.link.sinkPath = entry.hasKeywords ? entry.keywordsPath : std::string();
+            CubeAccess::attach(dynamic_cast<ASDFcube&>(*cube), std::move(state));
+            return cube;
         }
 
         /**
@@ -391,19 +417,34 @@ namespace DSL
         {
             if(entry.kind != HDUEntry::table)
                 throw FITSexception(NOT_TABLE, kWho, "GetTable", "HDU '"+entry.name+"' of "+path+" isn't a table");
+            std::lock_guard<std::mutex> lock(source->mtx);
             return readTable(entry.columns, entry.rows, entry.structured, entry.header);
         }
     };
 
-    ASDFmanager::ASDFmanager(const std::string& path): impl(std::make_unique<Impl>())
+    ASDFmanager::ASDFmanager(const std::string& path): ASDFmanager(path, ASDFreadOptions()) {}
+
+    ASDFmanager::ASDFmanager(const std::string& path, const ASDFreadOptions& options): impl(std::make_unique<Impl>())
     {
         impl->path = path;
-        impl->file.reset(asdf_open_file(path.c_str(), "r"));
-        if(!impl->file)
-            throw FITSexception(FILE_NOT_OPENED, kWho, "ctor", "can't open "+path+": "+lastError(nullptr));
-        if(asdf_error(impl->file.get()))
-            throw FITSexception(FILE_NOT_OPENED, kWho, "ctor", "can't open "+path+": "+lastError(impl->file.get()));
 
+        auto source = std::make_shared<FileSource>();
+        source->path = path;
+        source->tmpDir = options.tmpDir;
+
+        // Fields left at zero keep libasdf's defaults
+        asdf_config_t config{};
+        config.decomp.max_memory_bytes = options.maxMemoryBytes;
+        if(!source->tmpDir.empty())
+            config.decomp.tmp_dir = source->tmpDir.c_str();
+
+        source->file.reset(asdf_open_file_ex(path.c_str(), "r", &config));
+        if(!source->file)
+            throw FITSexception(FILE_NOT_OPENED, kWho, "ctor", "can't open "+path+": "+lastError(nullptr));
+        if(asdf_error(source->file.get()))
+            throw FITSexception(FILE_NOT_OPENED, kWho, "ctor", "can't open "+path+": "+lastError(source->file.get()));
+
+        impl->source = std::move(source);
         impl->discover();
     }
 
@@ -418,15 +459,42 @@ namespace DSL
     bool ASDFmanager::isOpen() const
     {
         std::lock_guard<std::mutex> lk(impl->mtx);
-        return static_cast<bool>(impl->file);
+        return static_cast<bool>(impl->source);
     }
 
     void ASDFmanager::Close()
     {
         std::lock_guard<std::mutex> lk(impl->mtx);
-        // The ndarrays depend on the file: they go first
-        impl->hdus.clear();
-        impl->file.reset();
+        if(!impl->source)
+            return;
+
+        // The ndarrays depend on the file: they go first, while nothing else uses it
+        {
+            std::lock_guard<std::mutex> lock(impl->source->mtx);
+            impl->hdus.clear();
+        }
+        // Handles handed out keep the file open; the manager's own go now
+        impl->tree = ASDFnode();
+        impl->source.reset();
+    }
+
+    ASDFnode ASDFmanager::GetTree()
+    {
+        std::lock_guard<std::mutex> lk(impl->mtx);
+        impl->requireOpen("GetTree");
+        return impl->tree.Clone();
+    }
+
+    std::shared_ptr<ASDFarray> ASDFmanager::GetArray(const std::string& path)
+    {
+        std::lock_guard<std::mutex> lk(impl->mtx);
+        impl->requireOpen("GetArray");
+        const ASDFnode* node = impl->tree.FindPath(path);
+        if(!node)
+            throw FITSexception(KEY_NO_EXIST, kWho, "GetArray", "nothing at '"+path+"' in "+impl->path);
+        if(!node->IsArray())
+            throw FITSexception(NOT_IMAGE, kWho, "GetArray", "'"+path+"' of "+impl->path+" isn't an ndarray");
+        return node->Array()->Clone();
     }
 
     std::shared_ptr<FITShdu> ASDFmanager::GetPrimaryHeader()
@@ -461,6 +529,40 @@ namespace DSL
     {
         std::lock_guard<std::mutex> lk(impl->mtx);
         return impl->loadImage(impl->named(name, "GetImage"));
+    }
+
+    std::shared_ptr<FITScube> ASDFmanager::GetImageWindow(const std::string& name, const std::vector<size_t>& origin, const std::vector<size_t>& size)
+    {
+        std::lock_guard<std::mutex> lk(impl->mtx);
+        HDUEntry& entry = impl->named(name, "GetImageWindow");
+        if(entry.kind != HDUEntry::image)
+            return impl->loadImage(entry);     // throws the reason
+
+        const std::vector<uint64_t> full = fitsAxes(entry.ndarray.get());
+        const size_t rank = full.size();
+        if(origin.size() > rank || size.size() > rank)
+            throw FITSexception(BAD_DIMEN, kWho, "GetImageWindow", "HDU '"+name+"' has "+std::to_string(rank)+" axes");
+
+        std::vector<size_t> start(origin);
+        std::vector<size_t> length(size);
+        start.resize(rank, 0);
+        length.resize(rank, 0);
+        Tile tile;
+        tile.origin.assign(rank, 0);
+        tile.size.assign(rank, 0);
+        for(size_t k = 0; k < rank; k++)
+        {
+            if(start[k] >= full[k])
+                throw FITSexception(BAD_DIMEN, kWho, "GetImageWindow", "position "+std::to_string(start[k])+" is past the end of axis "+std::to_string(k + 1)+" ("+std::to_string(full[k])+" pixels)");
+            if(length[k] == 0 || start[k] + length[k] > full[k])
+                length[k] = full[k] - start[k];
+            tile.origin[rank - 1 - k] = start[k];
+            tile.size  [rank - 1 - k] = length[k];
+        }
+
+        std::shared_ptr<FITScube> cube = impl->loadImage(entry, tile);
+        CubeAccess::afterWindow(dynamic_cast<ASDFcube&>(*cube), std::vector<size_t>(full.begin(), full.end()), start, "GetImageWindow");
+        return cube;
     }
 
     std::shared_ptr<FITStable> ASDFmanager::GetTableAtIndex(const int& index)

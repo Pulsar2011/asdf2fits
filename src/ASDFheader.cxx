@@ -36,6 +36,17 @@ namespace DSL::asdfdetail
         }
 
         /**
+         * @brief Put a text in lower case, to name tree keys.
+         * @param text Text to convert.
+         * @return The converted text.
+         */
+        std::string lower(std::string text)
+        {
+            std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c){ return std::tolower(c); });
+            return text;
+        }
+
+        /**
          * @brief Remove the spaces and tabs around a text.
          * @param text Text to trim.
          * @return The trimmed text; empty if nothing else is left.
@@ -61,63 +72,244 @@ namespace DSL::asdfdetail
         }
 
         /**
-         * @brief Set a keyword with the type of a scalar value.
-         * @details Selects on the exact type of the value. A null value sets nothing. Other scalars that have no
-         * keyword type, as well as infinities and NaN, are kept as text.
-         * @param value   Scalar value.
+         * @brief Set a keyword with the type of a scalar node.
+         * @details A null node, a container or an ndarray sets nothing. Infinities and NaN are kept as text.
+         * @param value   Scalar node.
          * @param key     Name of the keyword.
          * @param comment Comment of the keyword.
          * @param hdu     Header receiving the keyword.
+         * @return True if a keyword was set.
          */
-        void setScalar(asdf_value_t* value, const std::string& key, const std::string& comment, FITShdu& hdu)
+        bool setScalar(const ASDFnode& value, const std::string& key, const std::string& comment, FITShdu& hdu)
         {
-            bool     flag = false;
-            int64_t  sint = 0;
-            uint64_t uint = 0;
-            double   real = 0.;
-            const char* text = nullptr;
-
-            // By exact type: asdf_value_as_bool() also accepts the integers 0 and 1
-            switch(asdf_value_get_type(value))
+            switch(value.GetKind())
             {
-                case ASDF_VALUE_NULL:
-                    return;
-                case ASDF_VALUE_BOOL:
-                    if(asdf_value_as_bool(value, &flag) == ASDF_VALUE_OK)
-                        hdu.ValueForKey(key, flag, comment);
-                    return;
-                case ASDF_VALUE_UINT64:
-                    if(asdf_value_as_uint64(value, &uint) == ASDF_VALUE_OK)
-                    {
-                        hdu.ValueForKey(key, uint, comment);
-                        return;
-                    }
-                    break;
-                case ASDF_VALUE_INT8: case ASDF_VALUE_INT16: case ASDF_VALUE_INT32: case ASDF_VALUE_INT64:
-                case ASDF_VALUE_UINT8: case ASDF_VALUE_UINT16: case ASDF_VALUE_UINT32:
-                    if(asdf_value_as_int64(value, &sint) == ASDF_VALUE_OK)
-                    {
-                        hdu.ValueForKey(key, sint, comment);
-                        return;
-                    }
-                    break;
-                case ASDF_VALUE_FLOAT: case ASDF_VALUE_DOUBLE:
-                    // FITS has no form for infinities and NaN: they stay as text below
-                    if(asdf_value_as_double(value, &real) == ASDF_VALUE_OK && std::isfinite(real))
-                    {
-                        hdu.ValueForKey(key, real, comment);
-                        return;
-                    }
-                    break;
+                case ASDFnode::Kind::boolean:
+                    hdu.ValueForKey(key, value.Get<bool>(), comment);
+                    return true;
+                case ASDFnode::Kind::unsigned_integer:
+                    hdu.ValueForKey(key, value.Get<uint64_t>(), comment);
+                    return true;
+                case ASDFnode::Kind::integer:
+                    hdu.ValueForKey(key, value.Get<int64_t>(), comment);
+                    return true;
+                case ASDFnode::Kind::real:
+                    // FITS has no form for infinities and NaN: they stay as text
+                    if(std::isfinite(value.Get<double>()))
+                        hdu.ValueForKey(key, value.Get<double>(), comment);
+                    else
+                        hdu.ValueForKey(key, value.Text(), fChar, comment);
+                    return true;
+                case ASDFnode::Kind::string:
+                    hdu.ValueForKey(key, value.Get<std::string>(), fChar, comment);
+                    return true;
                 default:
+                    return false;
+            }
+        }
+
+        /**
+         * @brief Get the key of a card.
+         * @param card Card of an astropy FITS header.
+         * @param key  Receives its key.
+         * @return False for a card without a text key, such as a blank card.
+         */
+        bool cardKey(const ASDFnode& card, std::string& key)
+        {
+            if(!card.IsSequence() || card.Size() < 1 || !card[0].IsString())
+                return false;
+            key = card[0].Get<std::string>();
+            return true;
+        }
+
+        /**
+         * @brief Get the value of a keyword as a node of its keyword type.
+         * @details A value that doesn't parse as its declared type is kept as text.
+         * @param hdu Header holding the keyword.
+         * @param key Name of the keyword, which exists.
+         * @return The value.
+         */
+        ASDFnode keywordValue(const FITShdu& hdu, const std::string& key)
+        {
+            const FITSkeyword& keyword = hdu.GetEntry(key)->second;
+            try
+            {
+                switch(keyword.type())
+                {
+                    case fBool:
+                        return ASDFnode(hdu.GetBoolValueForKey(key));
+                    case fShort: case fInt: case fLong: case fLongLong:
+                        return ASDFnode(hdu.GetInt64ValueForKey(key));
+                    case fUShort: case fUInt: case fULong: case fULongLong: case fByte:
+                        return ASDFnode(hdu.GetUInt64ValueForKey(key));
+                    case fFloat: case fDouble:
+                        return ASDFnode(hdu.GetDoubleValueForKey(key));
+                    default:
+                        return ASDFnode(keyword.value());
+                }
+            }
+            catch(const FITSexception&)
+            {
+                return ASDFnode(keyword.value());
+            }
+        }
+
+        /**
+         * @brief Make the [key, value, comment] card of a keyword.
+         * @param hdu Header holding the keyword.
+         * @param key Name of the keyword, which exists.
+         * @return The card, without a comment if the keyword has none.
+         */
+        ASDFnode cardOf(const FITShdu& hdu, const std::string& key)
+        {
+            ASDFnode card = ASDFnode::Sequence();
+            card.Append(key);
+            card.Append(keywordValue(hdu, key));
+            const std::string comment = trim(hdu.GetEntry(key)->second.comment());
+            if(!comment.empty())
+                card.Append(comment);
+            return card;
+        }
+
+        /**
+         * @brief Tell whether a keyword is the same in two headers.
+         * @param a   First header.
+         * @param b   Second header.
+         * @param key Name of the keyword.
+         * @return True if both have it with the same value, type and comment, or neither has it.
+         */
+        bool sameKeyword(const FITShdu& a, const FITShdu& b, const std::string& key)
+        {
+            auto ia = a.GetEntry(key);
+            auto ib = b.GetEntry(key);
+            const bool inA = ia != a.end();
+            const bool inB = ib != b.end();
+            if(inA != inB)
+                return false;
+            return !inA || (ia->second.value() == ib->second.value() && ia->second.type() == ib->second.type()
+                            && ia->second.comment() == ib->second.comment());
+        }
+
+        /**
+         * @brief Remove the cards of a keyword.
+         * @param cards Card list.
+         * @param key   Keyword; for COMMENT, blank-key cards holding text go too, as readCards() counts them as COMMENT.
+         */
+        void eraseCards(ASDFnode& cards, const std::string& key)
+        {
+            std::vector<ASDFnode>& items = cards.Items();
+            items.erase(std::remove_if(items.begin(), items.end(), [&](const ASDFnode& card)
+            {
+                std::string k;
+                if(!cardKey(card, k))
+                    return false;
+                return k == key || (key == "COMMENT" && k.empty() && card.Size() > 1 && !card[1].Text().empty());
+            }), items.end());
+        }
+
+        /**
+         * @brief Append a commentary keyword as cards of 72 characters of text.
+         * @param cards Card list.
+         * @param key   COMMENT or HISTORY.
+         * @param text  Whole text of the keyword.
+         */
+        void appendCommentaryCards(ASDFnode& cards, const std::string& key, const std::string& text)
+        {
+            const size_t width = 72;
+            for(size_t pos = 0; pos < text.size(); pos += width)
+            {
+                ASDFnode card = ASDFnode::Sequence();
+                card.Append(key);
+                card.Append(text.substr(pos, width));
+                cards.Append(std::move(card));
+            }
+        }
+
+        /**
+         * @brief Copy into an astropy card list the changes made to a header.
+         * @param cards    Card list to update.
+         * @param hdu      The header now.
+         * @param snapshot The header when it matched @p cards.
+         */
+        void syncCards(ASDFnode& cards, const FITShdu& hdu, const FITShdu& snapshot)
+        {
+            if(!cards.IsSequence())
+                cards = ASDFnode::Sequence();
+
+            // Removed keywords
+            for(auto it = snapshot.begin(); it != snapshot.end(); ++it)
+                if(!hdu.Exists(it->first))
+                    eraseCards(cards, it->first);
+
+            // Changed and new keywords
+            for(auto it = hdu.begin(); it != hdu.end(); ++it)
+            {
+                const std::string& key = it->first;
+                if(sameKeyword(hdu, snapshot, key))
+                    continue;
+
+                if(key == "COMMENT" || key == "HISTORY")
+                {
+                    eraseCards(cards, key);
+                    appendCommentaryCards(cards, key, it->second.value());
+                    continue;
+                }
+
+                bool replaced = false;
+                for(ASDFnode& card : cards.Items())
+                {
+                    std::string k;
+                    if(cardKey(card, k) && k == key)
+                    {
+                        card = cardOf(hdu, key);
+                        replaced = true;
+                        break;
+                    }
+                }
+                if(!replaced)
+                    cards.Append(cardOf(hdu, key));
+            }
+        }
+
+        /**
+         * @brief Find where a keyword with no place in the tree goes.
+         * @details A dotted name A.B goes to the nested mappings a/b below the sink, if they can be made;
+         * any other name goes to the sink as it is, so that reading the tree again gives the same keyword.
+         * @param tree Tree to update.
+         * @param sink Path of the sink mapping.
+         * @param key  Name of the keyword.
+         * @return The path to set.
+         */
+        std::string newKeywordPath(const ASDFnode& tree, const std::string& sink, const std::string& key)
+        {
+            if(key.find('.') == std::string::npos || key.front() == '.' || key.back() == '.')
+                return ASDFnode::ChildPath(sink, key);
+
+            std::string path = sink;
+            size_t start = 0;
+            while(true)
+            {
+                const size_t dot = key.find('.', start);
+                const std::string part = lower(key.substr(start, dot == std::string::npos ? std::string::npos : dot - start));
+                if(part.empty())
+                    return ASDFnode::ChildPath(sink, key);
+                path = ASDFnode::ChildPath(path, part);
+                if(dot == std::string::npos)
                     break;
+
+                // Every level but the last must be, or become, a mapping
+                const ASDFnode* level = tree.FindPath(path);
+                if(level && !level->IsMapping())
+                    return ASDFnode::ChildPath(sink, key);
+                start = dot + 1;
             }
 
-            if(asdf_value_as_scalar0(value, &text) == ASDF_VALUE_OK && text)
-                hdu.ValueForKey(key, std::string(text), fChar, comment);
+            const ASDFnode* existing = tree.FindPath(path);
+            return (existing && !existing->IsScalar()) ? ASDFnode::ChildPath(sink, key) : path;
         }
     }
 
+#pragma region * Reading the tree
     bool isDataValue(asdf_value_t* value)
     {
         return hasTag(value, "core/ndarray-") || hasTag(value, "table/table-") || hasTag(value, "core/table-")
@@ -129,80 +321,110 @@ namespace DSL::asdfdetail
         return hasTag(value, "gwcs/") || hasTag(value, "/transform");
     }
 
-    void readCards(asdf_value_t* cards, FITShdu& hdu)
+    bool isDataNode(const ASDFnode& node)
     {
-        asdf_sequence_t* list = nullptr;
-        if(asdf_value_as_sequence(cards, &list) != ASDF_VALUE_OK)
+        return node.IsArray() || node.HasTag("core/ndarray-") || node.HasTag("table/table-") || node.HasTag("core/table-")
+            || node.HasTag("/fits/fits-");
+    }
+
+    bool isOpaqueNode(const ASDFnode& node)
+    {
+        return node.HasTag("gwcs/") || node.HasTag("/transform");
+    }
+
+    bool holdsData(const ASDFnode& node)
+    {
+        if(isOpaqueNode(node))
+            return false;
+        if(isDataNode(node))
+            return true;
+        for(const ASDFnode& item : node.Items())
+            if(holdsData(item))
+                return true;
+        return false;
+    }
+
+    void readCards(const ASDFnode& cards, FITShdu& hdu)
+    {
+        if(!cards.IsSequence())
             return;
 
-        asdf_sequence_iter_t* it = asdf_sequence_iter_init(list);
-        while(asdf_sequence_iter_next(&it))
+        for(const ASDFnode& card : cards.Items())
         {
-            asdf_sequence_t* card = nullptr;
-            if(asdf_value_as_sequence(it->value, &card) != ASDF_VALUE_OK)
-                continue;
-
-            const int size = asdf_sequence_size(card);
-            if(size < 1)
+            std::string key;
+            if(!cardKey(card, key))
                 continue;   // astropy writes blank cards as []
 
-            ValuePtr keyValue(asdf_sequence_get(card, 0));
-            const char* keyText = nullptr;
-            if(!keyValue || asdf_value_as_string0(keyValue.get(), &keyText) != ASDF_VALUE_OK || !keyText)
-                continue;
-            const std::string key(keyText);
-
-            ValuePtr value(size > 1 ? asdf_sequence_get(card, 1) : nullptr);
-            ValuePtr note (size > 2 ? asdf_sequence_get(card, 2) : nullptr);
-
-            const char* noteText = nullptr;
+            const ASDFnode* value = card.Size() > 1 ? &card[1] : nullptr;
             std::string comment;
-            if(note && asdf_value_as_string0(note.get(), &noteText) == ASDF_VALUE_OK && noteText)
-                comment = noteText;
+            if(card.Size() > 2 && card[2].IsString())
+                comment = card[2].Get<std::string>();
 
-            const char* text = nullptr;
             if(key.empty() || key == "COMMENT" || key == "HISTORY")
             {
                 // FITShdu keeps a single entry for commentary keywords, joining the cards as it
                 // does when reading a FITS file. Text under a blank keyword is commentary too.
-                if(value && asdf_value_as_scalar0(value.get(), &text) == ASDF_VALUE_OK && text && *text)
-                    appendCommentary(hdu, key.empty() ? "COMMENT" : key, text);
+                if(value && value->IsScalar() && !value->Text().empty())
+                    appendCommentary(hdu, key.empty() ? "COMMENT" : key, value->Text());
                 continue;
             }
 
             if(value)
-                setScalar(value.get(), key, comment, hdu);
+                setScalar(*value, key, comment, hdu);
             else
                 hdu.ValueForKey(key, std::string(), fChar, comment);
         }
     }
 
-    void readScalar(asdf_value_t* value, const std::string& key, FITShdu& hdu)
+    bool readScalar(const ASDFnode& value, const std::string& key, FITShdu& hdu)
     {
-        if(!asdf_value_is_container(value))
-            setScalar(value, key, std::string(), hdu);
+        return setScalar(value, key, std::string(), hdu);
     }
 
-    void readTreeKeywords(asdf_value_t* value, const std::string& prefix, FITShdu& hdu)
+    void readTreeKeywords(const ASDFnode& mapping, const std::string& prefix, const std::string& path, FITShdu& hdu, KeyPaths* paths)
     {
-        asdf_mapping_t* mapping = nullptr;
-        if(asdf_value_as_mapping(value, &mapping) != ASDF_VALUE_OK)
+        if(!mapping.IsMapping())
             return;
 
-        asdf_mapping_iter_t* it = asdf_mapping_iter_init(mapping);
-        while(asdf_mapping_iter_next(&it))
+        for(size_t i = 0; i < mapping.Size(); i++)
         {
-            if(isDataValue(it->value) || isOpaqueValue(it->value))
+            const ASDFnode& child = mapping.Items()[i];
+            const std::string& name = mapping.Keys()[i];
+            if(isDataNode(child) || isOpaqueNode(child))
                 continue;
 
-            const std::string key = prefix.empty() ? upper(it->key) : prefix + "." + upper(it->key);
-            if(asdf_value_is_mapping(it->value))
-                readTreeKeywords(it->value, key, hdu);
-            else
-                readScalar(it->value, key, hdu);
+            const std::string key = prefix.empty() ? upper(name) : prefix + "." + upper(name);
+            const std::string childPath = ASDFnode::ChildPath(path, name);
+            if(child.IsMapping())
+                readTreeKeywords(child, key, childPath, hdu, paths);
+            else if(readScalar(child, key, hdu) && paths)
+                (*paths)[key] = childPath;
         }
     }
 
+    void readRootKeywords(const ASDFnode& root, FITShdu& hdu, KeyPaths* paths)
+    {
+        if(!root.IsMapping())
+            return;
+
+        for(size_t i = 0; i < root.Size(); i++)
+        {
+            const ASDFnode& child = root.Items()[i];
+            const std::string& name = root.Keys()[i];
+            if(name == "asdf_library" || name == "history" || holdsData(child) || isOpaqueNode(child))
+                continue;
+
+            const std::string key = upper(name);
+            const std::string childPath = ASDFnode::ChildPath(std::string(), name);
+            if(child.IsMapping())
+                readTreeKeywords(child, key, childPath, hdu, paths);
+            else if(readScalar(child, key, hdu) && paths)
+                (*paths)[key] = childPath;
+        }
+    }
+
+#pragma endregion
+#pragma region * Structure keywords
     void clearImageStructure(FITShdu& hdu)
     {
         std::vector<std::string> stale;
@@ -298,6 +520,8 @@ namespace DSL::asdfdetail
         }
     }
 
+#pragma endregion
+#pragma region * Writing cards with libasdf
     namespace
     {
         /**
@@ -396,4 +620,117 @@ namespace DSL::asdfdetail
 
         return cards;
     }
+
+#pragma endregion
+#pragma region * Header and tree in step
+    bool isStructuralKey(const std::string& key, bool withExtname)
+    {
+        static const std::set<std::string> structural = {"SIMPLE", "XTENSION", "BITPIX", "NAXIS", "BSCALE", "BZERO", "BLANK",
+                                                          "EXTEND", "PCOUNT", "GCOUNT", "CHECKSUM", "DATASUM"};
+        static const std::regex naxis("NAXIS[0-9]+");
+        return structural.count(key) || std::regex_match(key, naxis) || (withExtname && key == "EXTNAME");
+    }
+
+    void syncHeader(ASDFnode& tree, HeaderLink& link, const FITShdu& hdu, const FITShdu& snapshot)
+    {
+        if(!link.cardsPath.empty())
+        {
+            ASDFnode* cards = tree.FindPath(link.cardsPath);
+            if(!cards)
+                cards = &tree.SetPath(link.cardsPath, ASDFnode::Sequence());
+            syncCards(*cards, hdu, snapshot);
+            return;
+        }
+
+        // Removed keywords
+        for(auto it = snapshot.begin(); it != snapshot.end(); ++it)
+        {
+            const std::string& key = it->first;
+            if(hdu.Exists(key) || isStructuralKey(key, true))
+                continue;
+            auto mapped = link.keyPaths.find(key);
+            if(mapped != link.keyPaths.end())
+            {
+                tree.ErasePath(mapped->second);
+                link.keyPaths.erase(mapped);
+            }
+        }
+
+        // Changed and new keywords
+        for(auto it = hdu.begin(); it != hdu.end(); ++it)
+        {
+            const std::string& key = it->first;
+            if(isStructuralKey(key, true) || sameKeyword(hdu, snapshot, key))
+                continue;
+
+            auto mapped = link.keyPaths.find(key);
+            if(mapped != link.keyPaths.end())
+            {
+                try
+                {
+                    tree.SetPath(mapped->second, keywordValue(hdu, key));
+                    continue;
+                }
+                catch(const FITSexception&)
+                {
+                    // The tree changed shape under the keyword: give it a new place below
+                    link.keyPaths.erase(mapped);
+                }
+            }
+
+            std::string path = newKeywordPath(tree, link.sinkPath, key);
+            try
+            {
+                tree.SetPath(path, keywordValue(hdu, key));
+            }
+            catch(const FITSexception&)
+            {
+                path = ASDFnode::ChildPath(link.sinkPath, key);
+                tree.SetPath(path, keywordValue(hdu, key));
+            }
+            link.keyPaths[key] = path;
+        }
+    }
+
+    void removeCards(ASDFnode& cards, const std::string& key)
+    {
+        if(cards.IsSequence())
+            eraseCards(cards, key);
+    }
+
+    void rebuildHeader(const ASDFnode& tree, HeaderLink& link, FITShdu& hdu)
+    {
+        const bool cards = !link.cardsPath.empty();
+
+        FITShdu fresh;
+        KeyPaths paths;
+        if(cards)
+        {
+            if(const ASDFnode* list = tree.FindPath(link.cardsPath))
+                readCards(*list, fresh);
+        }
+        else
+        {
+            if(link.hasKeywords)
+                if(const ASDFnode* mapping = tree.FindPath(link.keywordsPath))
+                    readTreeKeywords(*mapping, std::string(), link.keywordsPath, fresh, &paths);
+            if(link.rootKeywords)
+                readRootKeywords(tree, fresh, &paths);
+        }
+
+        std::vector<std::string> gone;
+        for(auto it = hdu.begin(); it != hdu.end(); ++it)
+            if(!isStructuralKey(it->first, !cards) && !fresh.Exists(it->first))
+                gone.push_back(it->first);
+        for(const std::string& key : gone)
+            hdu.DeleteKey(key);
+
+        for(auto it = fresh.begin(); it != fresh.end(); ++it)
+            if(!isStructuralKey(it->first, !cards))
+                hdu.ValueForKey(it->first, it->second.value(), it->second.type(), it->second.comment());
+
+        if(!cards)
+            link.keyPaths = std::move(paths);
+    }
+#pragma endregion
 }

@@ -33,6 +33,9 @@ namespace DSL
      *
      * The image is written as the primary HDU.
      *
+     * An image read from an ASDF file (an ASDFcube) is written as ASDFcube::WriteASDF() does instead: in
+     * the layout of its file, with its whole tree and its companion arrays.
+     *
      * @param cube    Image to save.
      * @param path    File to create.
      * @param replace Overwrite an existing file; otherwise an existing file throws FITSexception.

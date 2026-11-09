@@ -1,0 +1,36 @@
+Write the time of history entries back.
+
+libasdf rebuilds the core/asdf history every time it writes a file: each entry
+is deserialized, then serialized again. The serializer leaves out the "time"
+field (a TODO upstream), so every write drops the time of every history entry,
+including entries that were only copied from the file read.
+
+Write the time as the text it was read from, which the history_entry schema
+asks for: a date-time string.
+
+--- a/src/core/history_entry.c
++++ b/src/core/history_entry.c
+@@ -82,15 +82,20 @@
+     if (UNLIKELY(err != ASDF_VALUE_OK))
+         goto cleanup;
+ 
++    // The schema wants a date-time string: write the text that was read, as it was
++    if (entry->time && entry->time->value && entry->time->value[0] != '\0') {
++        err = asdf_mapping_set_string0(entry_map, "time", entry->time->value);
++
++        if (UNLIKELY(err != ASDF_VALUE_OK))
++            goto cleanup;
++    }
++
+     if (software_val)
+         err = asdf_mapping_set(entry_map, "software", software_val);
+ 
+     if (UNLIKELY(err != ASDF_VALUE_OK))
+         goto cleanup;
+ 
+-    // TODO: Serialize the .time field if set; wait on #91 for that since it
+-    // refactors a lot of timestamp handling
+-
+     value = asdf_value_of_mapping(entry_map);
+ cleanup:
+     if (UNLIKELY(err != ASDF_VALUE_OK)) {
