@@ -14,6 +14,10 @@
  */
 #include "ASDFcube.h"
 
+#include <algorithm>
+#include <cstring>
+#include <iostream>
+#include <mutex>
 #include <type_traits>
 
 #include "ASDFheader.h"
@@ -69,19 +73,14 @@ namespace DSL
         }
 
         /**
-         * @brief Remove the GWCS objects found below a node.
-         * @param tree  Root of the tree.
-         * @param scope Path of the node to search; empty for the whole tree.
-         * @return Paths of the objects removed.
+         * @brief Find the GWCS objects below a node: nodes tagged gwcs/..., not looking inside them.
+         * @param top The node.
+         * @return Their paths below @p top, in file order.
          */
-        std::vector<std::string> removeGWCS(ASDFnode& tree, const std::string& scope)
+        std::vector<std::string> gwcsObjects(const ASDFnode& top)
         {
             std::vector<std::string> found;
-            ASDFnode* top = tree.FindPath(scope);
-            if(!top)
-                return found;
-
-            top->Visit([&](const std::string& path, ASDFnode& node)
+            top.Visit([&](const std::string& path, const ASDFnode& node)
             {
                 if(node.HasTag("gwcs/") && !path.empty())
                 {
@@ -90,15 +89,215 @@ namespace DSL
                 }
                 return true;
             });
+            return found;
+        }
+
+        /**
+         * @brief Find the tag prefix and version of the compositions, concatenations and shifts of a GWCS.
+         * @details They are taken from the first of them in the GWCS. One version of the transform schemas gives
+         * these three kinds the same version.
+         * @param gwcs    The GWCS object.
+         * @param prefix  Receives the tag up to the kind, as "tag:stsci.edu:asdf/transform/".
+         * @param version Receives the version, as "1.3.0".
+         * @return False if the GWCS has none of them.
+         */
+        bool transformTags(const ASDFnode& gwcs, std::string& prefix, std::string& version)
+        {
+            bool found = false;
+            gwcs.Visit([&](const std::string&, const ASDFnode& node)
+            {
+                if(found)
+                    return false;
+                const std::string kind = ASDFtransform::KindOf(node.Tag());
+                for(const char* name : {"compose", "concatenate", "shift"})
+                    if(kind == std::string("transform/") + name)
+                    {
+                        const std::string& tag = node.Tag();
+                        const size_t at = tag.rfind(std::string("/") + name + "-");
+                        if(at != std::string::npos)
+                        {
+                            prefix = tag.substr(0, at + 1);
+                            version = tag.substr(at + 2 + std::strlen(name));
+                            found = true;
+                        }
+                        return false;
+                    }
+                return true;
+            });
+            return found;
+        }
+
+        /**
+         * @brief Make a list of texts.
+         * @param items The texts.
+         * @return A sequence node.
+         */
+        ASDFnode textList(std::initializer_list<const char*> items)
+        {
+            ASDFnode list = ASDFnode::Sequence();
+            for(const char* item : items)
+                list.Append(ASDFnode(item));
+            return list;
+        }
+
+        /**
+         * @brief Make the GWCS of an image work on a window of it.
+         * @details The first transform becomes a composition: a shift by the origin of the window on each axis,
+         * then the transform as it was. The bounding box moves to the composition, shifted and cut to the
+         * window, in the same form as it had (none becomes the whole window). The tags take the version of
+         * the compositions, concatenations or shifts already in the GWCS, so that gwcs reads the result.
+         * @param wcs    The GWCS object.
+         * @param origin First pixel of the window, NAXIS1 first.
+         * @param size   Lengths of the window, NAXIS1 first.
+         * @return False if the GWCS can't be read, isn't two-dimensional, or has no tag to copy; it is then
+         * left as it was.
+         */
+        bool shiftGWCS(ASDFnode& wcs, const std::vector<size_t>& origin, const std::vector<size_t>& size)
+        {
+            if(origin.size() != 2 || size.size() != 2)
+                return false;
+            std::shared_ptr<const ASDFgwcs> parsed;
+            try
+            {
+                parsed = ASDFgwcs::Read(wcs);
+            }
+            catch(const FITSexception&)
+            {
+                return false;
+            }
+            std::string prefix, version;
+            if(parsed->PixelAxes() != 2 || !transformTags(wcs, prefix, version))
+                return false;
+
+            ASDFnode& first = wcs.At("steps/0");
+            ASDFnode old = first.At("transform");
+            ASDFnode oldBox;
+            if(const ASDFnode* box = old.Find("bounding_box"))
+            {
+                oldBox = *box;
+                old.Erase("bounding_box");
+            }
+
+            // The window's pixel (i, j) is the image's pixel (i + x0, j + y0)
+            ASDFnode shifts = ASDFnode::Mapping(prefix + "concatenate-" + version);
+            ASDFnode& parts = shifts["forward"];
+            for(size_t k = 0; k < 2; k++)
+            {
+                ASDFnode shift = ASDFnode::Mapping(prefix + "shift-" + version);
+                shift["inputs"] = textList({"x"});
+                shift["offset"] = static_cast<double>(origin[k]);
+                shift["outputs"] = textList({"y"});
+                parts.Append(std::move(shift));
+            }
+            shifts["inputs"] = textList({"x0", "x1"});
+            shifts["outputs"] = textList({"y0", "y1"});
+
+            std::vector<std::pair<double,double>> ranges;
+            const std::vector<std::pair<double,double>>& before = parsed->BoundingBox();
+            for(size_t k = 0; k < 2; k++)
+            {
+                const double lower = -0.5, upper = static_cast<double>(size[k]) - 0.5;
+                if(before.empty())
+                    ranges.emplace_back(lower, upper);
+                else
+                    ranges.emplace_back(std::max(before[k].first - static_cast<double>(origin[k]), lower),
+                                        std::min(before[k].second - static_cast<double>(origin[k]), upper));
+            }
+
+            ASDFnode compose = ASDFnode::Mapping(prefix + "compose-" + version);
+            if(oldBox.IsMapping())
+            {
+                ASDFnode box = ASDFnode::Mapping(oldBox.Tag());
+                box["ignore"] = ASDFnode::Sequence();
+                ASDFnode& intervals = box["intervals"];
+                for(size_t k = 0; k < 2; k++)
+                {
+                    ASDFnode range = ASDFnode::Sequence();
+                    range.Append(ranges[k].first);
+                    range.Append(ranges[k].second);
+                    intervals["x" + std::to_string(k)] = std::move(range);
+                }
+                box["order"] = ASDFnode("F");
+                compose["bounding_box"] = std::move(box);
+            }
+            else
+            {
+                // The older form: a list of [lower, upper], the last axis first
+                ASDFnode box = ASDFnode::Sequence();
+                for(size_t k = 2; k-- > 0;)
+                {
+                    ASDFnode range = ASDFnode::Sequence();
+                    range.Append(ranges[k].first);
+                    range.Append(ranges[k].second);
+                    box.Append(std::move(range));
+                }
+                compose["bounding_box"] = std::move(box);
+            }
+
+            ASDFnode& chain = compose["forward"];
+            chain.Append(std::move(shifts));
+            chain.Append(old);
+            compose["inputs"] = textList({"x0", "x1"});
+            if(const ASDFnode* outputs = old.Find("outputs"))
+                compose["outputs"] = *outputs;
+            first["transform"] = std::move(compose);
+
+            if(ASDFnode* shape = wcs.Find("pixel_shape"); shape && !shape->IsNull())
+            {
+                ASDFnode lengths = ASDFnode::Sequence();
+                lengths.Append(static_cast<int64_t>(size[0]));
+                lengths.Append(static_cast<int64_t>(size[1]));
+                *shape = std::move(lengths);
+            }
+            return true;
+        }
+
+        /**
+         * @brief Shift the GWCS objects found below a node to a window, or remove those that can't be.
+         * @param tree    Root of the tree.
+         * @param scope   Path of the node to search; empty for the whole tree.
+         * @param origin  First pixel of the window, NAXIS1 first; empty to remove them all.
+         * @param size    Lengths of the window, NAXIS1 first.
+         * @param shifted Receives the paths of the objects shifted.
+         * @return Paths of the objects removed.
+         */
+        std::vector<std::string> fitGWCS(ASDFnode& tree, const std::string& scope, const std::vector<size_t>& origin,
+                                         const std::vector<size_t>& size, std::vector<std::string>& shifted)
+        {
+            ASDFnode* top = tree.FindPath(scope);
+            if(!top)
+                return {};
+
+            std::vector<std::string> doomed;
+            for(const std::string& path : gwcsObjects(*top))
+            {
+                ASDFnode& wcs = top->At(path);
+                if(!origin.empty() && ASDFtransform::KindOf(wcs.Tag()) == "gwcs/wcs" && shiftGWCS(wcs, origin, size))
+                    shifted.push_back(scope.empty() ? path : scope + "/" + path);
+                else
+                    doomed.push_back(path);
+            }
 
             // Last first, so that the indices of earlier sequence items still hold
-            for(auto it = found.rbegin(); it != found.rend(); ++it)
+            for(auto it = doomed.rbegin(); it != doomed.rend(); ++it)
                 top->ErasePath(*it);
 
             std::vector<std::string> removed;
-            for(const std::string& path : found)
+            for(const std::string& path : doomed)
                 removed.push_back(scope.empty() ? path : scope + "/" + path);
             return removed;
+        }
+
+        /**
+         * @brief Remove the GWCS objects found below a node.
+         * @param tree  Root of the tree.
+         * @param scope Path of the node to search; empty for the whole tree.
+         * @return Paths of the objects removed.
+         */
+        std::vector<std::string> removeGWCS(ASDFnode& tree, const std::string& scope)
+        {
+            std::vector<std::string> none;
+            return fitGWCS(tree, scope, {}, {}, none);
         }
 
         /**
@@ -128,9 +327,29 @@ namespace DSL
         }
     }
 
+    namespace asdfdetail
+    {
+        /** @brief The GWCS of an image, read when first asked for. */
+        struct GwcsCache
+        {
+            std::mutex lock;                        //!< Guards the rest: the GWCS is asked for from several threads
+            bool known = false;                     //!< The tree has been searched
+            std::string path;                       //!< Path of the GWCS object; empty if none
+            std::shared_ptr<const ASDFgwcs> gwcs;   //!< The GWCS; null if none or unusable
+
+            /** @brief Take what another cache knows. @param other The other cache; its lock is held. */
+            void copyFrom(const GwcsCache& other)
+            {
+                known = other.known;
+                path = other.path;
+                gwcs = other.gwcs;  // Immutable: sharing it is safe
+            }
+        };
+    }
+
 #pragma region - ASDFcube
 #pragma region * ctor
-    ASDFcube::ASDFcube(): flink(std::make_unique<HeaderLink>()) {}
+    ASDFcube::ASDFcube(): flink(std::make_unique<HeaderLink>()), fgwcs(std::make_unique<GwcsCache>()) {}
 
     ASDFcube::~ASDFcube() = default;
 
@@ -141,8 +360,12 @@ namespace DSL
         flink(std::make_unique<HeaderLink>(*other.flink)),
         fsnapshot(other.fsnapshot),
         fhistory(other.fhistory),
-        faligned(other.faligned)
-    {}
+        faligned(other.faligned),
+        fgwcs(std::make_unique<GwcsCache>())
+    {
+        std::lock_guard<std::mutex> guard(other.fgwcs->lock);
+        fgwcs->copyFrom(*other.fgwcs);
+    }
 
     ASDFcube& ASDFcube::operator=(const ASDFcube& other)
     {
@@ -156,7 +379,63 @@ namespace DSL
         fsnapshot.swap(snapshot);
         fhistory = other.fhistory;
         faligned = other.faligned;
+        std::scoped_lock guard(fgwcs->lock, other.fgwcs->lock);
+        fgwcs->copyFrom(*other.fgwcs);
         return *this;
+    }
+
+#pragma endregion
+#pragma region * GWCS
+    void ASDFcube::forgetGWCS() const
+    {
+        std::lock_guard<std::mutex> guard(fgwcs->lock);
+        fgwcs->known = false;
+        fgwcs->path.clear();
+        fgwcs->gwcs.reset();
+    }
+
+    std::shared_ptr<const ASDFgwcs> ASDFcube::GWCS() const
+    {
+        std::lock_guard<std::mutex> guard(fgwcs->lock);
+        if(fgwcs->known)
+            return fgwcs->gwcs;
+        fgwcs->known = true;
+
+        const std::string scope = fimagePath.empty() ? std::string() : ASDFnode::ParentPath(fimagePath);
+        const ASDFnode* top = ftree.FindPath(scope);
+        if(!top)
+            return nullptr;
+        for(const std::string& path : gwcsObjects(*top))
+            if(ASDFtransform::KindOf(top->At(path).Tag()) == "gwcs/wcs")
+            {
+                fgwcs->path = scope.empty() ? path : scope + "/" + path;
+                break;
+            }
+        if(fgwcs->path.empty())
+            return nullptr;
+
+        try
+        {
+            std::shared_ptr<const ASDFgwcs> gwcs = ASDFgwcs::Read(ftree.At(fgwcs->path));
+            if(gwcs->PixelAxes() != Cube().GetDimension())
+                std::cerr << "\033[33m[WARNING]\033[0m ASDFcube::GWCS: " << fgwcs->path << " has " << gwcs->PixelAxes()
+                          << " pixel axes, the image " << Cube().GetDimension() << "; the FITS WCS of the header is used instead" << std::endl;
+            else
+                fgwcs->gwcs = std::move(gwcs);
+        }
+        catch(const FITSexception& e)
+        {
+            std::cerr << "\033[33m[WARNING]\033[0m ASDFcube::GWCS: " << fgwcs->path << " can't be used: " << e.what()
+                      << "; the FITS WCS of the header is used instead" << std::endl;
+        }
+        return fgwcs->gwcs;
+    }
+
+    std::string ASDFcube::GWCSPath() const
+    {
+        GWCS();
+        std::lock_guard<std::mutex> guard(fgwcs->lock);
+        return fgwcs->path;
     }
 
 #pragma endregion
@@ -262,6 +541,7 @@ namespace DSL
 
     void ASDFcube::RefreshHDU()
     {
+        forgetGWCS();   // Meta() may have been changed
         SyncFromHDU();
         FITShdu& hdu = Cube().HDU();
         rebuildHeader(ftree, *flink, hdu);
@@ -279,6 +559,7 @@ namespace DSL
             return;
 
         // The shape changed without the hooks: what matched the old shape no longer matches
+        forgetGWCS();
         std::vector<std::string> dropped;
         for(const auto& [path, array] : companions(ftree))
             if(array->Axes() == faligned)
@@ -314,11 +595,19 @@ namespace DSL
                 ftree.At(path) = ASDFnode(array->Window(start, now));
                 cut.push_back(ASDFnode::SplitPath(path).back());
             }
-        const std::vector<std::string> gwcs = removeGWCS(ftree, ASDFnode::ParentPath(fimagePath));
+
+        // A 2D GWCS follows the window; any other is removed
+        forgetGWCS();
+        std::vector<std::string> shifted;
+        const std::vector<std::string> gwcs = before.size() == 2
+            ? fitGWCS(ftree, ASDFnode::ParentPath(fimagePath), start, now, shifted)
+            : removeGWCS(ftree, ASDFnode::ParentPath(fimagePath));
 
         std::string note = what+": "+axesText(before)+" to "+axesText(now)+" from pixel "+axesText(start);
         if(!cut.empty())
             note += "; companions cut too: "+join(cut);
+        if(!shifted.empty())
+            note += "; GWCS shifted to the window: "+join(shifted);
         if(!gwcs.empty())
             note += "; GWCS removed: "+join(gwcs);
         fhistory.push_back(note);
@@ -337,6 +626,7 @@ namespace DSL
                 ftree.At(path) = ASDFnode(array->Layer(index));
                 cut.push_back(ASDFnode::SplitPath(path).back());
             }
+        forgetGWCS();
         const std::vector<std::string> gwcs = removeGWCS(ftree, ASDFnode::ParentPath(fimagePath));
 
         std::string note = what+": layer "+std::to_string(index)+" of "+axesText(before);
@@ -362,6 +652,7 @@ namespace DSL
                 ftree.ErasePath(path);
                 dropped.push_back(ASDFnode::SplitPath(path).back());
             }
+        forgetGWCS();
         const std::vector<std::string> gwcs = removeGWCS(ftree, ASDFnode::ParentPath(fimagePath));
 
         std::string note = what+": "+axesText(before)+" to "+axesText(now);
@@ -385,6 +676,7 @@ namespace DSL
                 ftree.ErasePath(path);
                 dropped.push_back(ASDFnode::SplitPath(path).back());
             }
+        forgetGWCS();
         std::vector<std::string> gwcs;
         if(now != before)
             gwcs = removeGWCS(ftree, ASDFnode::ParentPath(fimagePath));
@@ -592,6 +884,78 @@ namespace DSL
         AfterReshape(before, "AddLayer");
     }
 
+    template<typename T>
+    worldCoords ASDFimg<T>::WorldCoordinates(const pixelCoords& pixel, const int& wcsIndex) const
+    {
+        if(wcsIndex == 0)
+            if(std::shared_ptr<const ASDFgwcs> gwcs = GWCS())
+                return gwcs->PixelToWorld(pixel);
+        return FITSimg<T>::WorldCoordinates(pixel, wcsIndex);
+    }
+
+    template<typename T>
+    worldVectors ASDFimg<T>::WorldCoordinatesVector(const pixelVectors& pixels, const int& wcsIndex) const
+    {
+        if(wcsIndex == 0)
+            if(std::shared_ptr<const ASDFgwcs> gwcs = GWCS())
+            {
+                worldVectors world;
+                world.reserve(pixels.size());
+                for(const pixelCoords& pixel : pixels)
+                    world.push_back(gwcs->PixelToWorld(pixel));
+                return world;
+            }
+        return FITSimg<T>::WorldCoordinatesVector(pixels, wcsIndex);
+    }
+
+    template<typename T>
+    pixelCoords ASDFimg<T>::World2Pixel(const worldCoords& world, const int& wcsIndex) const
+    {
+        if(wcsIndex == 0)
+            if(std::shared_ptr<const ASDFgwcs> gwcs = GWCS())
+                return gwcs->WorldToPixel(world);
+        return FITSimg<T>::World2Pixel(world, wcsIndex);
+    }
+
+    template<typename T>
+    pixelVectors ASDFimg<T>::World2PixelVector(const worldVectors& world, const int& wcsIndex) const
+    {
+        if(wcsIndex == 0)
+            if(std::shared_ptr<const ASDFgwcs> gwcs = GWCS())
+            {
+                pixelVectors pixels;
+                pixels.reserve(world.size());
+                for(const worldCoords& position : world)
+                    pixels.push_back(gwcs->WorldToPixel(position));
+                return pixels;
+            }
+        return FITSimg<T>::World2PixelVector(world, wcsIndex);
+    }
+
+    template<typename T>
+    bool ASDFimg<T>::HasWorldCoordinates() const
+    {
+        return GWCS() != nullptr || FITSimg<T>::HasWorldCoordinates();
+    }
+
+    template<typename T>
+    std::vector<std::string> ASDFimg<T>::WorldAxisNames(const int& wcsIndex) const
+    {
+        if(wcsIndex == 0)
+            if(std::shared_ptr<const ASDFgwcs> gwcs = GWCS())
+                return gwcs->OutputFrame().axesNames;
+        return FITSimg<T>::WorldAxisNames(wcsIndex);
+    }
+
+    template<typename T>
+    std::vector<std::string> ASDFimg<T>::WorldAxisUnits(const int& wcsIndex) const
+    {
+        if(wcsIndex == 0)
+            if(std::shared_ptr<const ASDFgwcs> gwcs = GWCS())
+                return gwcs->OutputFrame().units;
+        return FITSimg<T>::WorldAxisUnits(wcsIndex);
+    }
+
     template class ASDFimg<int8_t>;
     template class ASDFimg<uint8_t>;
     template class ASDFimg<int16_t>;
@@ -689,6 +1053,7 @@ namespace DSL
             FITShdu snapshot(cube.Cube().HDU());
             cube.fsnapshot.swap(snapshot);
             cube.faligned = cube.axesNow();
+            cube.forgetGWCS();
         }
     }
 #pragma endregion

@@ -53,7 +53,8 @@ namespace DSL
      *  - any other tree: each numeric ndarray is an image, each structured ndarray or
      *    .../table-* value is a table. Scalars are turned into keywords, nested keys being joined
      *    as META.INSTRUMENT.NAME. An HDU is named after its tree path, and the one called PRIMARY
-     *    (or else the first found) is the primary HDU. GWCS objects are not converted.
+     *    (or else the first found) is the primary HDU. GWCS objects are not turned into keywords: images
+     *    use them for their world coordinates (see ASDFcube::GWCS()).
      *
      * Values in an ASDF file are physical: BSCALE and BZERO found in a header are not applied.
      * NaN (real images) or the BLANK value (integer images) mark masked pixels.
@@ -178,8 +179,9 @@ namespace DSL
         /**
          * @brief Read part of the image of an HDU.
          * @details Only the pixels of the window are read. The companions of the same shape show the same
-         * window, the GWCS objects next to the image are removed, and a history entry records the cut (see
-         * ASDFcube). A FITS WCS of the header is shifted to the window.
+         * window, a GWCS of a 2D image is shifted to the window (other GWCS objects next to the image are
+         * removed), and a history entry records the cut (see ASDFcube). A FITS WCS of the header is shifted to
+         * the window.
          * @param name   Name of the HDU, matched without regard to case.
          * @param origin First pixel of the window, NAXIS1 first; missing axes start at 0.
          * @param size   Length of the window along each axis, NAXIS1 first; missing or 0 lengths, or lengths

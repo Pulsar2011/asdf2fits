@@ -51,8 +51,8 @@ Failures throw `FITSexception`.
 
 Not converted:
 
-- GWCS objects (Roman, JWST): such files load without a FITS WCS. The objects stay in the tree of an `ASDFimg`
-  and are written back unchanged.
+- GWCS objects (Roman, JWST) don't become FITS keywords: an `ASDFimg` uses them for its world coordinates (see
+  [World coordinates](#world-coordinates-gwcs)), and they are written back as they were.
 - Table columns that aren't plain ndarrays (`Time`, `Quantity`, `SkyCoord`) are left out.
 - Complex and string images, and ndarray `mask` properties, which libasdf doesn't read.
 - Strided tables, which throw.
@@ -109,8 +109,9 @@ std::dynamic_pointer_cast<ASDFcube>(cut)->WriteASDF("cut.asdf", options);
   keeps nothing. A handle keeps its file open, even after the manager is closed.
 - **Changes of shape.** `Window()`, `Resize()` and `Layer()` cut the companions of the image's shape the same way,
   as views that read nothing until loaded. `Rebin()`, `Overlay()`, `AddLayer()` and any other change of shape drop
-  them: err or dq can't be combined like pixels. A change of shape also removes the GWCS objects next to the image,
-  which would no longer match it; the FITS WCS of the header is kept up to date by `FITSimg`.
+  them: err or dq can't be combined like pixels. A window of a 2D image shifts its GWCS to the window; any other
+  change of shape removes the GWCS objects next to the image, which would no longer match it. The FITS WCS of the
+  header is kept up to date by `FITSimg`.
 - **Results.** Processing code that builds plain `FITSimg<T>` results gives them the tree back with
   `asdfLike(result, *asdf, "what was done")`, which drops the companions of the image's shape.
 - **Writing.** `WriteASDF()` writes the whole tree: the image and the loaded arrays from memory, the arrays not
@@ -122,9 +123,53 @@ std::dynamic_pointer_cast<ASDFcube>(cut)->WriteASDF("cut.asdf", options);
 - **Large files.** `ASDFreadOptions::maxMemoryBytes` makes libasdf decompress larger arrays to a temporary file
   rather than to memory.
 
-Not supported: GWCS objects aren't converted to a FITS WCS; YAML anchors are read, but each alias is written as a
-copy of what it points to; `float16` and `bool8` companions that are loaded are written back as `float32` and
-`uint8`.
+Not supported: YAML anchors are read, but each alias is written as a copy of what it points to; `float16` and
+`bool8` companions that are loaded are written back as `float32` and `uint8`.
+
+### World coordinates (GWCS)
+
+The GWCS of an image is the first GWCS object next to it, such as `roman/meta/wcs` for `roman/data`.
+`ASDFimg<T>` overrides the WCS methods of `FITScube` with it, so code written for FITS images, the FitsViewer
+among them, uses it without knowing:
+
+```c++
+std::shared_ptr<FITScube> image = file.GetImage("roman.data");
+worldCoords sky   = image->WorldCoordinates(pixelCoords{100., 200.});   // GWCS: 0-based pixels, degrees
+pixelCoords pixel = image->World2Pixel(sky);
+
+auto gwcs = std::dynamic_pointer_cast<ASDFcube>(image)->GWCS();        // null if none, or unusable
+gwcs->Frames();                                                         // detector, v2v3, ..., world
+gwcs->Convert("v2v3", "world", {v2, v3});                               // between any two frames
+```
+
+- **Transforms.** A GWCS is a chain of frames linked by transforms, read by `ASDFtransform::Read()`. Each kind of
+  transform is a class derived from `ASDFtransform`, built by a builder registered under the name of its tag. The
+  library knows `compose`, `concatenate`, `add`/`subtract`/`multiply`/`divide`/`power`, `shift`, `scale`,
+  `multiplyscale`, `identity`, `remap_axes`, `constant`, `polynomial` (1D and 2D, with domain and window),
+  `affine`, `rotate_sequence_3d`, `gnomonic`, `rotate3d` (native/celestial) and gwcs's `spherical_cartesian`:
+  enough for the imaging GWCS of Roman and JWST.
+- **A new kind of transform** is added by deriving a class and registering its builder, without changing the
+  library. A GWCS using a kind not registered can't be used: `GWCS()` gives null, with a warning naming the kind,
+  and the FITS WCS of the header, if any, is used instead.
+
+  ```c++
+  class Square : public ASDFtransform
+  {
+  public:
+      Square(): ASDFtransform(1, 1) {}                                  // inputs, outputs
+      void Evaluate(const double* in, double* out) const override { out[0] = in[0] * in[0]; }
+  };
+  ASDFtransform::Register("transform/square", [](const ASDFnode& node) { return std::make_shared<Square>(); });
+  ```
+
+  Parameters are read from the node with `ASDFtransform::Number()`, `Numbers()` (ndarrays, lists, quantities)
+  and `Operands()` (the transforms under `forward`). A class that knows its inverse overrides `AnalyticInverse()`.
+- **Inverses.** World to pixel uses the inverse the file gives (`inverse:` of a transform), otherwise the one the
+  transform gives itself (a shift, a scale, a rotation, a composition of those...). If a step has neither, the
+  pixel is found by Newton's method.
+- **Bounding box.** As in gwcs, a pixel outside the bounding box gives NaN, and so does a world position whose
+  pixel falls outside it.
+- **JWST.** JWST products are FITS files with the GWCS in an `ASDF` extension: not read yet.
 
 ## What is written
 
@@ -191,6 +236,22 @@ A patch that no longer applies stops the build with a message: if the new libasd
 Adding, changing or removing a patch copies and builds libasdf again at the next build. libfyaml and libmd are
 linked into `libasdf`, so `libasdf2fits`, `libasdf` and their headers are all that gets installed.
 `-DWITH_ASAN=ON` builds with AddressSanitizer.
+
+Some tests need real Roman and JWST files, which are too large for git. They are downloaded on request into
+`test/data` (ignored by git), and the tests that need a missing file are skipped:
+
+```sh
+cmake --build build --target fetch_samples           # all, ~450 MB
+cmake -DSAMPLES=small -P cmake/FetchSamples.cmake    # only the JWST GWCS objects of the gwcs package, ~35 kB
+```
+
+| File | What it is |
+|---|---|
+| `gwcs_nircamwcs.asdf`, `gwcs_miriwcs.asdf` | JWST NIRCam and MIRI imaging GWCS objects, without pixels (gwcs test data, pinned commit) |
+| `roman_wfi01_f106_cal.asdf` | Simulated Roman WFI L2 image (romancal 0.18) with its GWCS in `meta/wcs`; `meta/wcsinfo/s_region` gives the sky position of the corners |
+| `jwst_nrcb1_cal.fits` | JWST NIRCam L2 image (program 2736); GWCS in the `ASDF` extension, TAN-SIP approximation in the SCI header |
+
+Each file is checked against its SHA-256, and one already there isn't downloaded again.
 
 To use the library from CMake:
 

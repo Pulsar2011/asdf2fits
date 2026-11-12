@@ -24,6 +24,7 @@
 #include <DSTfits/FITSimg.h>
 
 #include "ASDFarray.h"
+#include "ASDFgwcs.h"
 #include "ASDFnode.h"
 
 namespace DSL
@@ -32,6 +33,7 @@ namespace DSL
     {
         struct HeaderLink;
         struct CubeAccess;
+        struct GwcsCache;
     }
 
     /** @brief Options of ASDFcube::WriteASDF(). */
@@ -68,8 +70,11 @@ namespace DSL
      * any other change of shape drop them, as their pixels can't be combined like the image's; a history
      * entry says so.
      *
-     * **GWCS.** A change of shape also removes the GWCS objects found next to the image, as they would no
-     * longer match its pixels; the FITS WCS of the header is kept up to date by FITSimg.
+     * **GWCS.** The first GWCS object found next to the image is its world coordinate system (see GWCS()):
+     * ASDFimg\<T\> converts pixels to world coordinates and back with it, in place of the FITS WCS of the header.
+     * A window of a 2D image (Window(), Resize()) shifts the GWCS to the window. Any other change of shape
+     * removes the GWCS objects found next to the image, as they would no longer match its pixels; the FITS WCS
+     * of the header is kept up to date by FITSimg.
      *
      * **Writing.** WriteASDF() writes the whole tree in its own layout: the image from memory, loaded arrays
      * from memory, arrays not loaded copied from their file as they are, still compressed, without being
@@ -139,6 +144,24 @@ namespace DSL
          * image's, BAD_DATATYPE if it doesn't hold integers.
          */
         size_t MaskFromDQ(uint64_t bits = ~uint64_t(0), const std::string& name = "dq");
+
+#pragma endregion
+#pragma region * GWCS
+        /**
+         * @brief Get the world coordinate system of the image.
+         * @details The first GWCS object found next to the image (below the mapping holding it, as roman/meta/wcs
+         * for an image at roman/data), read on the first call and kept until the tree changes. A GWCS that can't
+         * be used, because a kind of transform isn't known (see ASDFtransform::Register()) or because its pixel
+         * axes aren't those of the image, gives null, with a warning on the first call.
+         * @return The GWCS; null if there is none or it can't be used.
+         */
+        std::shared_ptr<const ASDFgwcs> GWCS() const;
+
+        /**
+         * @brief Get where the GWCS of the image is in the tree.
+         * @return The path of the GWCS object found by GWCS(), even if it can't be used; empty if there is none.
+         */
+        std::string GWCSPath() const;
 
 #pragma endregion
 #pragma region * Header and tree
@@ -222,6 +245,7 @@ namespace DSL
         std::vector<size_t> axesNow() const;            //!< Axis lengths of the image now
         std::vector<std::pair<std::string, std::shared_ptr<ASDFarray>>> companions(const ASDFnode& tree) const; //!< Companions in a tree, path and handle
         void alignTo(const std::vector<size_t>& before);//!< Drop the companions left behind by a change of shape made without the hooks
+        void forgetGWCS() const;                        //!< The tree changed: read the GWCS again when asked
 
         ASDFnode ftree;                                 //!< Tree of the file
         std::string fimagePath;                         //!< Path of the image's ndarray
@@ -230,6 +254,7 @@ namespace DSL
         FITShdu fsnapshot;                              //!< The header when it last matched the tree
         std::vector<std::string> fhistory;              //!< Changes to record as history entries
         std::vector<size_t> faligned;                   //!< Axis lengths of the image the companions match
+        std::unique_ptr<asdfdetail::GwcsCache> fgwcs;   //!< The GWCS, once read
     };
 
     /**
@@ -261,6 +286,44 @@ namespace DSL
 
         using FITScube::Rebin;
         using FITScube::Resize;
+        using FITScube::WorldCoordinates;
+        using FITScube::WorldCoordinatesVector;
+
+        /**
+         * @brief Get the world coordinates of a pixel.
+         * @details With the GWCS of the image (see ASDFcube::GWCS()) when it has one and @p wcsIndex is 0;
+         * otherwise as FITSimg, with the FITS WCS of the header. The other forms of WorldCoordinates() and
+         * WorldCoordinatesVector() come here too.
+         * @param pixel    Position, 0-based, NAXIS1 first.
+         * @param wcsIndex Index of the WCS; 0 is the GWCS if there is one.
+         * @return The world coordinates; NaN outside the bounding box of the GWCS.
+         */
+        worldCoords  WorldCoordinates(const pixelCoords& pixel, const int& wcsIndex = 0) const override;
+        worldVectors WorldCoordinatesVector(const pixelVectors& pixels, const int& wcsIndex = 0) const override;   //!< As WorldCoordinates(), for several pixels
+        /**
+         * @brief Get the pixel of world coordinates.
+         * @details As WorldCoordinates(): with the GWCS when there is one and @p wcsIndex is 0.
+         * @param world    World coordinates.
+         * @param wcsIndex Index of the WCS; 0 is the GWCS if there is one.
+         * @return The position, 0-based, NAXIS1 first; NaN if it is outside the bounding box of the GWCS.
+         */
+        pixelCoords  World2Pixel(const worldCoords& world, const int& wcsIndex = 0) const override;
+        pixelVectors World2PixelVector(const worldVectors& world, const int& wcsIndex = 0) const override;         //!< As World2Pixel(), for several positions
+
+        /** @brief Tell whether the image has world coordinates. @return True with a GWCS, or as FITSimg with a FITS WCS. */
+        bool HasWorldCoordinates() const override;
+        /**
+         * @brief Get the name of each world axis.
+         * @param wcsIndex Index of the WCS; 0 is the GWCS if there is one.
+         * @return The axes_names of the output frame of the GWCS, such as {"lon", "lat"}; otherwise as FITSimg (CTYPEi).
+         */
+        std::vector<std::string> WorldAxisNames(const int& wcsIndex = 0) const override;
+        /**
+         * @brief Get the unit of each world axis.
+         * @param wcsIndex Index of the WCS; 0 is the GWCS if there is one.
+         * @return The units of the output frame of the GWCS, such as {"deg", "deg"}; otherwise as FITSimg (CUNITi).
+         */
+        std::vector<std::string> WorldAxisUnits(const int& wcsIndex = 0) const override;
 
         std::shared_ptr<FITScube> Layer(const size_t& index) const override;                                   //!< As FITSimg; companions become layers too
         std::shared_ptr<FITScube> Window(size_t xMin, size_t yMin, size_t xSize, size_t ySize) const override;  //!< As FITSimg; companions become windows too

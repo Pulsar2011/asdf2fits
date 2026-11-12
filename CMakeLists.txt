@@ -244,11 +244,13 @@ set(ASDF2FITS_SOURCES
     src/ASDFnode.cxx
     src/ASDFarray.cxx
     src/ASDFcube.cxx
+    src/ASDFtransform.cxx
+    src/ASDFgwcs.cxx
     src/ASDFtree.cxx
     src/ASDFwrite.cxx
     src/fits2asdf.cxx
 )
-set(ASDF2FITS_PUBLIC_HEADERS src/ASDFmanager.h src/fits2asdf.h src/ASDFnode.h src/ASDFarray.h src/ASDFcube.h)
+set(ASDF2FITS_PUBLIC_HEADERS src/ASDFmanager.h src/fits2asdf.h src/ASDFnode.h src/ASDFarray.h src/ASDFcube.h src/ASDFtransform.h src/ASDFgwcs.h)
 
 if(EXISTS ${CMAKE_SOURCE_DIR}/src/ASDFmanager.cxx)
     add_library(asdf2fits SHARED ${ASDF2FITS_SOURCES})
@@ -314,7 +316,13 @@ if(BUILD_TESTS AND TARGET asdf2fits AND EXISTS ${CMAKE_SOURCE_DIR}/test/gTest_as
     target_compile_definitions(gTest_asdf2fits PRIVATE
         ASDF_FIXTURES="${CMAKE_SOURCE_DIR}/libasdf/tests/fixtures"
         LIBASDF_VERSION="${LIBASDF_VERSION}"
-        ASDF2FITS_TEST_DIR="${CMAKE_BINARY_DIR}/Testing/Temporary")
+        ASDF2FITS_TEST_DIR="${CMAKE_BINARY_DIR}/Testing/Temporary"
+        ASDF2FITS_SAMPLES="${CMAKE_SOURCE_DIR}/test/data")
+    # Real Roman and JWST files, too large for git: downloaded on request only (see cmake/FetchSamples.cmake)
+    add_custom_target(fetch_samples
+        COMMAND ${CMAKE_COMMAND} -DDEST=${CMAKE_SOURCE_DIR}/test/data -P ${CMAKE_SOURCE_DIR}/cmake/FetchSamples.cmake
+        COMMENT "Downloading the Roman and JWST sample files"
+        USES_TERMINAL)
     # A timeout, as a parser bug in libasdf shows up as a test that never ends
     gtest_discover_tests(gTest_asdf2fits WORKING_DIRECTORY ${CMAKE_BINARY_DIR} PROPERTIES TIMEOUT 120)
     message("${Blue}-- Test executable ${ColourReset} gTest_asdf2fits (run with ctest)")

@@ -15,7 +15,9 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <locale>
 #include <memory>
+#include <numbers>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -165,7 +167,73 @@ namespace
     uint32_t dqAt   (size_t x, size_t y) { return (x % 7 == 3 ? 1u : 0u) | (y == 5 ? 4u : 0u); }
     uint16_t amp33At(size_t x, size_t y) { return static_cast<uint16_t>(y * 10 + x); }
 
-    void writeRoman(const std::string& path)
+    // A GWCS of one frame and no transform: it can't be used, so changes of shape remove it
+    const char* const kStubWcs =
+        "    wcs: !<tag:stsci.edu:gwcs/wcs-1.4.0>\n"
+        "      name: detector\n"
+        "      steps:\n"
+        "      - !<tag:stsci.edu:gwcs/step-1.3.0>\n"
+        "        frame: !<tag:stsci.edu:gwcs/frame2d-1.2.0>\n"
+        "          name: detector\n"
+        "          unit: [!unit/unit-1.0.0 pixel, !unit/unit-1.0.0 pixel]\n";
+
+    // A linear GWCS of the 64x48 image: u = (x - 31.5) / 1000, v = (y - 23.5) / 500, in the bounding box
+    const char* const kLinearWcs =
+        "    wcs: !<tag:stsci.edu:gwcs/wcs-1.4.0>\n"
+        "      name: linear\n"
+        "      pixel_shape: null\n"
+        "      steps:\n"
+        "      - !<tag:stsci.edu:gwcs/step-1.3.0>\n"
+        "        frame: !<tag:stsci.edu:gwcs/frame2d-1.2.0>\n"
+        "          axes_names: [x, y]\n"
+        "          name: detector\n"
+        "          unit: [!unit/unit-1.0.0 pixel, !unit/unit-1.0.0 pixel]\n"
+        "        transform: !transform/compose-1.3.0\n"
+        "          bounding_box: !transform/property/bounding_box-1.1.0\n"
+        "            ignore: []\n"
+        "            intervals:\n"
+        "              x0: [-0.5, 63.5]\n"
+        "              x1: [-0.5, 47.5]\n"
+        "            order: F\n"
+        "          forward:\n"
+        "          - !transform/concatenate-1.3.0\n"
+        "            forward:\n"
+        "            - !transform/shift-1.3.0 {offset: -31.5}\n"
+        "            - !transform/shift-1.3.0 {offset: -23.5}\n"
+        "          - !transform/concatenate-1.3.0\n"
+        "            forward:\n"
+        "            - !transform/scale-1.3.0 {factor: 0.001}\n"
+        "            - !transform/scale-1.3.0 {factor: 0.002}\n"
+        "          inputs: [x0, x1]\n"
+        "          outputs: [y0, y1]\n"
+        "      - !<tag:stsci.edu:gwcs/step-1.3.0>\n"
+        "        frame: !<tag:stsci.edu:gwcs/frame2d-1.2.0>\n"
+        "          axes_names: [u, v]\n"
+        "          name: world\n"
+        "          unit: [!unit/unit-1.0.0 deg, !unit/unit-1.0.0 deg]\n"
+        "        transform: null\n";
+
+    // u = 1 + x/2 + y/1000 + x^2/10^4, v = -2 + x/500 + 0.6 y + x y/5000: polynomials without an inverse
+    const char* const kPolynomialWcs =
+        "    wcs: !<tag:stsci.edu:gwcs/wcs-1.4.0>\n"
+        "      name: polynomial\n"
+        "      steps:\n"
+        "      - !<tag:stsci.edu:gwcs/step-1.3.0>\n"
+        "        frame: !<tag:stsci.edu:gwcs/frame2d-1.2.0> {name: detector}\n"
+        "        transform: !transform/compose-1.3.0\n"
+        "          forward:\n"
+        "          - !transform/remap_axes-1.4.0 {mapping: [0, 1, 0, 1]}\n"
+        "          - !transform/concatenate-1.3.0\n"
+        "            forward:\n"
+        "            - !transform/polynomial-1.2.0\n"
+        "              coefficients: [[1.0, 0.001, 0.0], [0.5, 0.0, 0.0], [0.0001, 0.0, 0.0]]\n"
+        "            - !transform/polynomial-1.2.0\n"
+        "              coefficients: [[-2.0, 0.6, 0.0], [0.002, 0.0002, 0.0], [0.0, 0.0, 0.0]]\n"
+        "      - !<tag:stsci.edu:gwcs/step-1.3.0>\n"
+        "        frame: !<tag:stsci.edu:gwcs/frame2d-1.2.0> {name: world}\n"
+        "        transform: null\n";
+
+    void writeRoman(const std::string& path, const std::string& wcs = kStubWcs)
     {
         std::vector<float> data, err;
         std::vector<uint32_t> dq;
@@ -197,13 +265,7 @@ namespace
             "      nresultants: 10\n"
             "    instrument: {detector: WFI01, name: WFI, optical_element: F158}\n"
             "    cal_logs: ['first line', \"second line\\nwith a break\"]\n"
-            "    wcs: !<tag:stsci.edu:gwcs/wcs-1.4.0>\n"
-            "      name: detector\n"
-            "      steps:\n"
-            "      - !<tag:stsci.edu:gwcs/step-1.3.0>\n"
-            "        frame: !<tag:stsci.edu:gwcs/frame2d-1.2.0>\n"
-            "          name: detector\n"
-            "          unit: [!unit/unit-1.0.0 pixel, !unit/unit-1.0.0 pixel]\n"
+            + wcs +
             "  data: !core/ndarray-1.1.0 {source: 0, datatype: float32, byteorder: little, shape: [48, 64]}\n"
             "  err: !core/ndarray-1.1.0 {source: 1, datatype: float32, byteorder: little, shape: [48, 64]}\n"
             "  dq: !core/ndarray-1.1.0 {source: 2, datatype: uint32, byteorder: little, shape: [48, 64]}\n"
@@ -2100,6 +2162,509 @@ TEST(LibasdfMultiHDU, LibasdfReadsATreeOfAllPixelTypesWrittenByASDF2fits)
     EXPECT_EQ(asdf_get_string0(file, "f32/label", &label), ASDF_VALUE_OK);
     EXPECT_STREQ(label, "f32 image");
     asdf_close(file);
+}
+
+// ---------------------------------------------------------------------- GWCS
+
+namespace
+{
+    // A transform as the tree holds it
+    ASDFnode transformNode(const std::string& kind, const std::string& version = "1.3.0")
+    {
+        return ASDFnode::Mapping("tag:stsci.edu:asdf/transform/" + kind + "-" + version);
+    }
+
+    ASDFnode numberList(std::initializer_list<double> values)
+    {
+        ASDFnode list = ASDFnode::Sequence();
+        for(double value : values)
+            list.Append(value);
+        return list;
+    }
+
+    ASDFnode nodeList(std::initializer_list<ASDFnode> items)
+    {
+        ASDFnode list = ASDFnode::Sequence();
+        for(const ASDFnode& item : items)
+            list.Append(item);
+        return list;
+    }
+
+    ASDFnode shiftNode(double offset)
+    {
+        ASDFnode node = transformNode("shift");
+        node["offset"] = offset;
+        return node;
+    }
+
+    ASDFnode scaleNode(double factor)
+    {
+        ASDFnode node = transformNode("scale");
+        node["factor"] = factor;
+        return node;
+    }
+
+    // A kind of transform the library doesn't know: factor * x^3
+    class CubeTransform final : public ASDFtransform
+    {
+    public:
+        explicit CubeTransform(double factor): ASDFtransform(1, 1), factor_(factor) {}
+        void Evaluate(const double* in, double* out) const override { out[0] = factor_ * in[0] * in[0] * in[0]; }
+
+    private:
+        double factor_;
+    };
+
+    // Distance on the sky, degrees
+    double skyDistance(double ra1, double dec1, double ra2, double dec2)
+    {
+        const double dra = std::fmod(ra1 - ra2 + 540., 360.) - 180.;
+        return std::hypot(dra * std::cos(dec1 * std::numbers::pi / 180.), dec1 - dec2);
+    }
+
+    // The vertices (ra, dec) of an S_REGION "POLYGON ICRS ra1 dec1 ra2 dec2 ..."
+    std::vector<std::pair<double,double>> polygon(const std::string& sRegion)
+    {
+        std::istringstream in(sRegion);
+        in.imbue(std::locale::classic());
+        std::string word;
+        in >> word >> word;
+        std::vector<std::pair<double,double>> vertices;
+        double ra = 0., dec = 0.;
+        while(in >> ra >> dec)
+            vertices.emplace_back(ra, dec);
+        return vertices;
+    }
+
+    // Largest distance between the vertices of an S_REGION and the nearest corner of the bounding box, whether
+    // the pipeline took the corners at the edges of the pixels or at their centres
+    double sRegionError(const ASDFgwcs& gwcs, const std::string& sRegion)
+    {
+        const double inf = std::numeric_limits<double>::infinity();
+        const auto vertices = polygon(sRegion);
+        const auto& box = gwcs.BoundingBox();
+        if(vertices.size() != 4 || box.size() != 2)
+            return inf;
+
+        double best = inf;
+        for(double inset : {0., 0.5})
+        {
+            std::vector<std::vector<double>> corners;
+            for(double x : {box[0].first + inset, box[0].second - inset})
+                for(double y : {box[1].first + inset, box[1].second - inset})
+                    corners.push_back(gwcs.PixelToWorld({x, y}));
+            double worst = 0.;
+            for(const auto& [ra, dec] : vertices)
+            {
+                double nearest = inf;
+                for(const auto& corner : corners)
+                    nearest = std::min(nearest, skyDistance(ra, dec, corner[0], corner[1]));
+                worst = std::max(worst, nearest);
+            }
+            best = std::min(best, worst);
+        }
+        return best;
+    }
+
+    // Files downloaded by cmake/FetchSamples.cmake
+    std::string sample(const std::string& name)
+    {
+        return std::string(ASDF2FITS_SAMPLES) + "/" + name;
+    }
+}
+
+#define SKIP_WITHOUT(path) \
+    do { if(!std::filesystem::exists(path)) GTEST_SKIP() << (path) << " is missing: cmake --build build --target fetch_samples"; } while(0)
+
+TEST(ASDFtransform, KindIsTheTagWithoutItsVersion)
+{
+    EXPECT_EQ(ASDFtransform::KindOf("tag:stsci.edu:asdf/transform/shift-1.3.0"), "transform/shift");
+    EXPECT_EQ(ASDFtransform::KindOf("asdf://asdf-format.org/transform/tags/shift-1.4.0"), "transform/shift");
+    EXPECT_EQ(ASDFtransform::KindOf("tag:stsci.edu:gwcs/spherical_cartesian-1.2.0"), "gwcs/spherical_cartesian");
+    EXPECT_EQ(ASDFtransform::KindOf(""), "");
+    for(const char* kind : {"transform/compose", "transform/concatenate", "transform/shift", "transform/scale",
+                            "transform/remap_axes", "transform/polynomial", "transform/affine", "transform/rotate_sequence_3d",
+                            "transform/divide", "transform/constant", "transform/identity", "gwcs/spherical_cartesian",
+                            "transform/gnomonic", "transform/rotate3d"})
+        EXPECT_TRUE(ASDFtransform::IsKnown(kind)) << kind;
+}
+
+TEST(ASDFtransform, SimpleTransformsAndTheirInverses)
+{
+    // (x + 2.5) * 4, and back
+    ASDFnode compose = transformNode("compose");
+    compose["forward"] = nodeList({shiftNode(2.5), scaleNode(4.)});
+    auto chain = ASDFtransform::Read(compose);
+    EXPECT_EQ(chain->Kind(), "transform/compose");
+    EXPECT_EQ(chain->Inputs(), 1u);
+    EXPECT_DOUBLE_EQ((*chain)({1.})[0], 14.);
+    ASSERT_TRUE(chain->Inverse());
+    EXPECT_DOUBLE_EQ((*chain->Inverse())({14.})[0], 1.);
+
+    // Mappings give each input back from the first output it went to
+    ASDFnode remap = transformNode("remap_axes", "1.4.0");
+    remap["mapping"] = numberList({1, 0, 1});
+    auto mapping = ASDFtransform::Read(remap);
+    EXPECT_EQ((*mapping)({7., 8.}), (std::vector<double>{8., 7., 8.}));
+    ASSERT_TRUE(mapping->Inverse());
+    EXPECT_EQ((*mapping->Inverse())({8., 7., 8.}), (std::vector<double>{7., 8.}));
+
+    // Affine transforms are inverted as matrices
+    ASDFnode affineNode = transformNode("affine", "1.4.0");
+    affineNode["matrix"] = nodeList({numberList({1., 2.}), numberList({3., 4.})});
+    affineNode["translation"] = numberList({5., 6.});
+    auto affine = ASDFtransform::Read(affineNode);
+    EXPECT_EQ((*affine)({1., 1.}), (std::vector<double>{8., 13.}));
+    const std::vector<double> back = (*affine->Inverse())({8., 13.});
+    EXPECT_NEAR(back[0], 1., 1e-12);
+    EXPECT_NEAR(back[1], 1., 1e-12);
+
+    // Rotations turn the frame, as astropy's: by +90 degrees about z, the x axis becomes -y
+    ASDFnode quarter = transformNode("rotate_sequence_3d", "1.1.0");
+    quarter["angles"] = numberList({90.});
+    quarter["axes_order"] = ASDFnode("z");
+    const std::vector<double> turned = (*ASDFtransform::Read(quarter))({1., 0., 0.});
+    EXPECT_NEAR(turned[0], 0., 1e-15);
+    EXPECT_NEAR(turned[1], -1., 1e-15);
+    EXPECT_NEAR(turned[2], 0., 1e-15);
+
+    ASDFnode rotation = transformNode("rotate_sequence_3d", "1.1.0");
+    rotation["angles"] = numberList({10., 20., 30.});
+    rotation["axes_order"] = ASDFnode("zyx");
+    rotation["rotation_type"] = ASDFnode("cartesian");
+    auto rotate = ASDFtransform::Read(rotation);
+    const std::vector<double> rotated = (*rotate)({0.6, 0., 0.8});
+    EXPECT_NEAR(std::hypot(rotated[0], rotated[1], rotated[2]), 1., 1e-15);
+    const std::vector<double> unrotated = (*rotate->Inverse())(rotated);
+    EXPECT_NEAR(unrotated[0], 0.6, 1e-15);
+    EXPECT_NEAR(unrotated[1], 0., 1e-15);
+    EXPECT_NEAR(unrotated[2], 0.8, 1e-15);
+
+    // Longitude and latitude to a vector and back, the longitude in [0, 360)
+    ASDFnode s2c = ASDFnode::Mapping("tag:stsci.edu:gwcs/spherical_cartesian-1.2.0");
+    s2c["transform_type"] = ASDFnode("spherical_to_cartesian");
+    s2c["wrap_lon_at"] = 360;
+    auto toVector = ASDFtransform::Read(s2c);
+    const std::vector<double> y = (*toVector)({90., 0.});
+    EXPECT_NEAR(y[0], 0., 1e-15);
+    EXPECT_NEAR(y[1], 1., 1e-15);
+    EXPECT_NEAR(y[2], 0., 1e-15);
+    const std::vector<double> lonLat = (*toVector->Inverse())({0., -1., 0.});
+    EXPECT_NEAR(lonLat[0], 270., 1e-12);
+    EXPECT_NEAR(lonLat[1], 0., 1e-12);
+}
+
+TEST(ASDFtransform, PolynomialsAndTheInverseGivenByTheFile)
+{
+    // The coefficient of x^i y^j is at [i, j]: 1 + 3x + 2y
+    ASDFnode plane = transformNode("polynomial", "1.2.0");
+    plane["coefficients"] = nodeList({numberList({1., 2., 0.}), numberList({3., 0., 0.}), numberList({0., 0., 0.})});
+    auto p = ASDFtransform::Read(plane);
+    EXPECT_EQ(p->Inputs(), 2u);
+    EXPECT_DOUBLE_EQ((*p)({2., 5.})[0], 17.);
+    EXPECT_FALSE(p->Inverse());
+
+    // The domain is mapped to the window first: [0, 10] to [-1, 1]
+    ASDFnode mapped = transformNode("polynomial", "1.2.0");
+    mapped["coefficients"] = numberList({0., 1.});
+    mapped["domain"] = numberList({0., 10.});
+    mapped["window"] = numberList({-1., 1.});
+    auto m = ASDFtransform::Read(mapped);
+    EXPECT_DOUBLE_EQ((*m)({5.})[0], 0.);
+    EXPECT_DOUBLE_EQ((*m)({10.})[0], 1.);
+
+    // 1 + 2x, with the inverse the file gives: (y - 1) / 2
+    ASDFnode line = transformNode("polynomial", "1.2.0");
+    line["coefficients"] = numberList({1., 2.});
+    ASDFnode inverse = transformNode("compose");
+    inverse["forward"] = nodeList({shiftNode(-1.), scaleNode(0.5)});
+    line["inverse"] = inverse;
+    auto l = ASDFtransform::Read(line);
+    EXPECT_DOUBLE_EQ((*l)({2.})[0], 5.);
+    ASSERT_TRUE(l->Inverse());
+    EXPECT_DOUBLE_EQ((*l->Inverse())({5.})[0], 2.);
+}
+
+TEST(ASDFtransform, UnknownKindsFailUntilRegistered)
+{
+    ASDFnode node = ASDFnode::Mapping("tag:example.org:test/transform/cube-1.0.0");
+    node["factor"] = 2.;
+    ASSERT_FALSE(ASDFtransform::IsKnown("transform/cube"));
+    EXPECT_THROW(ASDFtransform::Read(node), WCSexception);
+
+    ASDFtransform::Register("transform/cube", [](const ASDFnode& n)
+    {
+        return std::make_shared<CubeTransform>(ASDFtransform::Number(n, "factor", 1.));
+    });
+    EXPECT_TRUE(ASDFtransform::IsKnown("transform/cube"));
+
+    auto cube = ASDFtransform::Read(node);
+    EXPECT_EQ(cube->Kind(), "transform/cube");
+    EXPECT_DOUBLE_EQ((*cube)({3.})[0], 54.);
+    EXPECT_FALSE(cube->Inverse());
+
+    // Inside the transforms of the library too: 2 (x + 1)^3
+    ASDFnode compose = transformNode("compose");
+    compose["forward"] = nodeList({shiftNode(1.), node});
+    EXPECT_DOUBLE_EQ((*ASDFtransform::Read(compose))({2.})[0], 54.);
+    EXPECT_FALSE(ASDFtransform::Read(compose)->Inverse());
+}
+
+TEST(ASDFgwcs, RomanFixtureTakesItsReferencePointToTheSky)
+{
+    ASDFmanager file(fixture("roman_l2_wcs"));
+    ASDFnode tree = file.GetTree();
+    auto gwcs = ASDFgwcs::Read(tree.At("roman/meta/wcs"));
+
+    EXPECT_EQ(gwcs->InputFrame().name, "detector");
+    EXPECT_EQ(gwcs->OutputFrame().name, "world");
+    EXPECT_TRUE(gwcs->OutputFrame().IsCelestial());
+    EXPECT_EQ(gwcs->OutputFrame().referenceFrame, "icrs");
+    EXPECT_EQ(gwcs->OutputFrame().units, (std::vector<std::string>{"deg", "deg"}));
+    EXPECT_EQ(gwcs->PixelAxes(), 2u);
+    EXPECT_EQ(gwcs->WorldAxes(), 2u);
+    EXPECT_TRUE(gwcs->HasInverse());
+    ASSERT_EQ(gwcs->BoundingBox().size(), 2u);
+    EXPECT_EQ(gwcs->BoundingBox()[0], std::make_pair(-0.5, 4087.5));
+    EXPECT_EQ(gwcs->BoundingBox()[1], std::make_pair(-0.5, 4087.5));
+
+    // The pipeline points (v2_ref, v3_ref) of the telescope at (ra_ref, dec_ref)
+    const ASDFnode& info = tree.At("roman/meta/wcsinfo");
+    const double v2 = info.At("v2_ref").Get<double>(), v3 = info.At("v3_ref").Get<double>();
+    const double ra = info.At("ra_ref").Get<double>(), dec = info.At("dec_ref").Get<double>();
+    const std::vector<double> sky = gwcs->Convert("v2v3corr", "world", {v2, v3});
+    EXPECT_LT(skyDistance(sky[0], sky[1], ra, dec), 1e-10) << sky[0] << " " << sky[1];
+    const std::vector<double> v2v3 = gwcs->Convert("world", "v2v3corr", {ra, dec});
+    EXPECT_NEAR(v2v3[0], v2, 1e-6);
+    EXPECT_NEAR(v2v3[1], v3, 1e-6);
+}
+
+TEST(ASDFgwcs, RomanFixtureMatchesTheCornersOfItsSRegion)
+{
+    ASDFmanager file(fixture("roman_l2_wcs"));
+    ASDFnode tree = file.GetTree();
+    auto gwcs = ASDFgwcs::Read(tree.At("roman/meta/wcs"));
+
+    // S_REGION is written by the pipeline with 9 decimals: 1e-8 degree is 36 micro-arcseconds
+    const double error = sRegionError(*gwcs, tree.At("roman/meta/wcsinfo/s_region").Get<std::string>());
+    EXPECT_LT(error, 1e-8) << "largest distance to a corner: " << error * 3600. << " arcsec";
+}
+
+TEST(ASDFgwcs, RomanFixtureRoundTripsInsideTheBoundingBoxOnly)
+{
+    ASDFmanager file(fixture("roman_l2_wcs"));
+    auto gwcs = ASDFgwcs::Read(file.GetTree().At("roman/meta/wcs"));
+
+    for(const std::vector<double>& pixel : std::vector<std::vector<double>>{{0., 0.}, {2043.5, 2043.5}, {4087., 0.}, {100.25, 3900.75}, {4087., 4087.}})
+    {
+        const std::vector<double> world = gwcs->PixelToWorld(pixel);
+        ASSERT_TRUE(std::isfinite(world[0]) && std::isfinite(world[1]));
+        const std::vector<double> back = gwcs->WorldToPixel(world);
+        EXPECT_NEAR(back[0], pixel[0], 0.01) << pixel[0] << "," << pixel[1];
+        EXPECT_NEAR(back[1], pixel[1], 0.01) << pixel[0] << "," << pixel[1];
+    }
+
+    // Outside the bounding box: NaN, unless asked otherwise
+    EXPECT_TRUE(std::isnan(gwcs->PixelToWorld({-0.6, 10.})[0]));
+    EXPECT_TRUE(std::isfinite(gwcs->PixelToWorld({-0.6, 10.}, false)[0]));
+    const std::vector<double> far = gwcs->PixelToWorld({4500., 4500.}, false);
+    EXPECT_TRUE(std::isnan(gwcs->WorldToPixel(far)[0]));
+}
+
+TEST(ASDFgwcs, PixelFoundByNewtonWhenAStepHasNoInverse)
+{
+    TempFile path(".asdf");
+    writeRoman(path.path(), kPolynomialWcs);
+    ASDFmanager file(path.path());
+    auto gwcs = ASDFgwcs::Read(file.GetTree().At("roman/meta/wcs"));
+    EXPECT_FALSE(gwcs->HasInverse());
+    EXPECT_TRUE(gwcs->BoundingBox().empty());
+
+    const std::vector<double> world = gwcs->PixelToWorld({10., 20.});
+    EXPECT_NEAR(world[0], 6.03, 1e-12);
+    EXPECT_NEAR(world[1], 10.06, 1e-12);
+
+    for(const std::vector<double>& pixel : std::vector<std::vector<double>>{{10., 20.}, {-3.5, 61.25}, {40., 2.}})
+    {
+        const std::vector<double> back = gwcs->WorldToPixel(gwcs->PixelToWorld(pixel));
+        EXPECT_NEAR(back[0], pixel[0], 1e-8);
+        EXPECT_NEAR(back[1], pixel[1], 1e-8);
+    }
+}
+
+TEST(ASDFimage, WorldCoordinatesComeFromTheGWCS)
+{
+    TempFile path(".asdf");
+    writeRoman(path.path(), kLinearWcs);
+    ASDFmanager file(path.path());
+    std::shared_ptr<FITScube> image = file.GetImage("roman.data");
+    auto asdf = asASDF(image);
+    ASSERT_TRUE(asdf->GWCS());
+    EXPECT_EQ(asdf->GWCSPath(), "roman/meta/wcs");
+    EXPECT_EQ(asdf->GWCS()->OutputFrame().axesNames, (std::vector<std::string>{"u", "v"}));
+
+    // What the axes are, through FITScube
+    EXPECT_TRUE(image->HasWorldCoordinates());
+    EXPECT_EQ(image->getNumberOfWCS(), 0u);     // no FITS WCS in the header
+    EXPECT_EQ(image->WorldAxisNames(), (std::vector<std::string>{"u", "v"}));
+    EXPECT_EQ(image->WorldAxisUnits(), (std::vector<std::string>{"deg", "deg"}));
+
+    // Every form of WorldCoordinates() of FITScube comes to the GWCS
+    const worldCoords w = image->WorldCoordinates(pixelCoords{10., 20.});
+    ASSERT_EQ(w.size(), 2u);
+    EXPECT_NEAR(w[0], -0.0215, 1e-15);
+    EXPECT_NEAR(w[1], -0.007, 1e-15);
+    EXPECT_EQ(image->WorldCoordinates(std::vector<size_t>{10, 20}), w);
+    EXPECT_EQ(image->WorldCoordinates(size_t(20 * kNX + 10)), w);
+    const worldVectors several = image->WorldCoordinatesVector(pixelVectors{{10., 20.}, {0., 0.}});
+    ASSERT_EQ(several.size(), 2u);
+    EXPECT_EQ(several[0], w);
+    EXPECT_NEAR(several[1][0], -0.0315, 1e-15);
+
+    const pixelCoords p = image->World2Pixel(w);
+    EXPECT_NEAR(p[0], 10., 1e-9);
+    EXPECT_NEAR(p[1], 20., 1e-9);
+    const pixelVectors ps = image->World2PixelVector(worldVectors{w, several[1]});
+    EXPECT_NEAR(ps[1][0], 0., 1e-9);
+    EXPECT_NEAR(ps[1][1], 0., 1e-9);
+
+    // Outside the bounding box
+    EXPECT_TRUE(std::isnan(image->WorldCoordinates(pixelCoords{-1., 0.})[0]));
+    EXPECT_TRUE(std::isnan(image->World2Pixel(worldCoords{1., 1.})[0]));
+}
+
+TEST(ASDFimage, AnUnusableGWCSLeavesTheFITSWCS)
+{
+    TempFile path(".asdf");
+    writeRoman(path.path());
+    ASDFmanager file(path.path());
+    std::shared_ptr<FITScube> image = file.GetImage("roman.data");
+    auto asdf = asASDF(image);
+    EXPECT_FALSE(asdf->GWCS());
+    EXPECT_EQ(asdf->GWCSPath(), "roman/meta/wcs");
+    EXPECT_FALSE(image->HasWorldCoordinates());
+    EXPECT_TRUE(image->WorldAxisNames().empty());
+    // No WCS at all: FITScube gives the pixel back
+    EXPECT_EQ(image->WorldCoordinates(pixelCoords{3., 4.}), (worldCoords{3., 4.}));
+}
+
+TEST(ASDFimage, WindowShiftsTheGWCS)
+{
+    TempFile in(".asdf"), out(".asdf");
+    writeRoman(in.path(), kLinearWcs);
+    ASDFmanager file(in.path());
+    std::shared_ptr<FITScube> image = file.GetImage("roman.data");
+    std::shared_ptr<FITScube> cut = image->Window(10, 20, 30, 16);
+    auto asdf = asASDF(cut);
+    ASSERT_TRUE(asdf->GWCS());
+
+    for(const auto& [x, y] : std::vector<std::pair<double,double>>{{0., 0.}, {29., 15.}, {12.5, 3.25}})
+    {
+        const worldCoords w = cut->WorldCoordinates(pixelCoords{x, y});
+        const worldCoords e = image->WorldCoordinates(pixelCoords{x + 10., y + 20.});
+        EXPECT_NEAR(w[0], e[0], 1e-15) << x << "," << y;
+        EXPECT_NEAR(w[1], e[1], 1e-15) << x << "," << y;
+    }
+    const pixelCoords p = cut->World2Pixel(image->WorldCoordinates(pixelCoords{12., 25.}));
+    EXPECT_NEAR(p[0], 2., 1e-9);
+    EXPECT_NEAR(p[1], 5., 1e-9);
+
+    // The bounding box is the window's
+    EXPECT_EQ(asdf->GWCS()->BoundingBox()[0], std::make_pair(-0.5, 29.5));
+    EXPECT_EQ(asdf->GWCS()->BoundingBox()[1], std::make_pair(-0.5, 15.5));
+    EXPECT_TRUE(std::isnan(cut->WorldCoordinates(pixelCoords{30., 0.})[0]));
+    ASSERT_EQ(asdf->PendingHistory().size(), 1u);
+    EXPECT_NE(asdf->PendingHistory()[0].find("GWCS shifted to the window: roman/meta/wcs"), std::string::npos);
+    EXPECT_EQ(asdf->Meta().At("roman/meta/wcs/steps/0/transform").Tag(), "tag:stsci.edu:asdf/transform/compose-1.3.0");
+
+    // The image it was cut from is unchanged
+    EXPECT_EQ(asASDF(image)->GWCS()->BoundingBox()[0], std::make_pair(-0.5, 63.5));
+
+    // The shifted GWCS is written, and reads back the same
+    asdf->WriteASDF(out.path());
+    ASDFmanager back(out.path());
+    std::shared_ptr<FITScube> reread = back.GetImage("roman.data");
+    const worldCoords w = reread->WorldCoordinates(pixelCoords{12.5, 3.25});
+    const worldCoords e = image->WorldCoordinates(pixelCoords{22.5, 23.25});
+    EXPECT_NEAR(w[0], e[0], 1e-15);
+    EXPECT_NEAR(w[1], e[1], 1e-15);
+
+    // A window read from the file gets the same GWCS
+    std::shared_ptr<FITScube> read = file.GetImageWindow("roman.data", {10, 20}, {30, 16});
+    EXPECT_EQ(read->WorldCoordinates(pixelCoords{12.5, 3.25}), cut->WorldCoordinates(pixelCoords{12.5, 3.25}));
+}
+
+// ---------------------------------------------------------------------- Real files, downloaded on request
+
+TEST(Samples, JwstNircamGWCS)
+{
+    const std::string path = sample("gwcs_nircamwcs.asdf");
+    SKIP_WITHOUT(path);
+    ASDFmanager file(path);
+    auto gwcs = ASDFgwcs::Read(file.GetTree().At("wcs"));
+    EXPECT_EQ(gwcs->InputFrame().name, "detector");
+    EXPECT_EQ(gwcs->OutputFrame().name, "world");
+    EXPECT_TRUE(gwcs->HasInverse());
+
+    // The angles of its rotation to the sky: (v2_ref, -v3_ref, roll, dec_ref, -ra_ref)
+    const double v2 = 0.023917627222222224 * 3600., v3 = -0.13700764222222223 * 3600.;
+    const double ra = 5.868934166666667, dec = -71.99550858333333;
+    const std::vector<double> sky = gwcs->Convert("v2v3", "world", {v2, v3});
+    EXPECT_LT(skyDistance(sky[0], sky[1], ra, dec), 1e-10) << sky[0] << " " << sky[1];
+
+    for(const std::vector<double>& pixel : std::vector<std::vector<double>>{{0., 0.}, {1023.5, 1023.5}, {2047., 2047.}, {100., 1900.}})
+    {
+        const std::vector<double> back = gwcs->WorldToPixel(gwcs->PixelToWorld(pixel));
+        EXPECT_NEAR(back[0], pixel[0], 0.01) << pixel[0] << "," << pixel[1];
+        EXPECT_NEAR(back[1], pixel[1], 0.01) << pixel[0] << "," << pixel[1];
+    }
+}
+
+TEST(Samples, JwstMiriGWCS)
+{
+    const std::string path = sample("gwcs_miriwcs.asdf");
+    SKIP_WITHOUT(path);
+    ASDFmanager file(path);
+    auto gwcs = ASDFgwcs::Read(file.GetTree().At("wcs"));
+    EXPECT_TRUE(gwcs->OutputFrame().IsCelestial());
+    ASSERT_EQ(gwcs->BoundingBox().size(), 2u);
+
+    const auto& box = gwcs->BoundingBox();
+    for(double fx : {0.1, 0.5, 0.9})
+        for(double fy : {0.1, 0.5, 0.9})
+        {
+            const std::vector<double> pixel{box[0].first + fx * (box[0].second - box[0].first),
+                                            box[1].first + fy * (box[1].second - box[1].first)};
+            const std::vector<double> world = gwcs->PixelToWorld(pixel);
+            ASSERT_TRUE(std::isfinite(world[0]) && std::isfinite(world[1]));
+            const std::vector<double> back = gwcs->WorldToPixel(world);
+            EXPECT_NEAR(back[0], pixel[0], 0.01) << pixel[0] << "," << pixel[1];
+            EXPECT_NEAR(back[1], pixel[1], 0.01) << pixel[0] << "," << pixel[1];
+        }
+}
+
+TEST(Samples, RomanL2ImageWindowKeepsItsSky)
+{
+    const std::string path = sample("roman_wfi01_f106_cal.asdf");
+    SKIP_WITHOUT(path);
+    ASDFmanager file(path);
+    ASDFnode tree = file.GetTree();
+    auto full = ASDFgwcs::Read(tree.At("roman/meta/wcs"));
+    const double error = sRegionError(*full, tree.At("roman/meta/wcsinfo/s_region").Get<std::string>());
+    EXPECT_LT(error, 1e-8) << "largest distance to a corner: " << error * 3600. << " arcsec";
+
+    std::shared_ptr<FITScube> cut = file.GetImageWindow("roman.data", {1000, 2000}, {64, 32});
+    ASSERT_TRUE(asASDF(cut)->GWCS());
+    for(const auto& [x, y] : std::vector<std::pair<double,double>>{{0., 0.}, {63., 31.}, {10.5, 20.25}})
+    {
+        const worldCoords w = cut->WorldCoordinates(pixelCoords{x, y});
+        const std::vector<double> e = full->PixelToWorld({x + 1000., y + 2000.});
+        EXPECT_NEAR(w[0], e[0], 1e-12);
+        EXPECT_NEAR(w[1], e[1], 1e-12);
+        const pixelCoords p = cut->World2Pixel(w);
+        EXPECT_NEAR(p[0], x, 0.01);
+        EXPECT_NEAR(p[1], y, 0.01);
+    }
 }
 
 // ---------------------------------------------------------------------- Known bugs of libasdf, not patched
