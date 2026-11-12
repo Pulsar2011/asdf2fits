@@ -166,7 +166,9 @@ gwcs->Convert("v2v3", "world", {v2, v3});                               // betwe
   and `Operands()` (the transforms under `forward`). A class that knows its inverse overrides `AnalyticInverse()`.
 - **Inverses.** World to pixel uses the inverse the file gives (`inverse:` of a transform), otherwise the one the
   transform gives itself (a shift, a scale, a rotation, a composition of those...). If a step has neither, the
-  pixel is found by Newton's method.
+  pixel is found by Newton's method. As in gwcs, an inverse given by the file is used as it is: the distortion
+  inverses of JWST and Roman are fitted polynomials, good to a few hundredths of a pixel. An inverse whose number
+  of inputs or outputs doesn't fit its transform (astropy writes some, never used) is ignored.
 - **Bounding box.** As in gwcs, a pixel outside the bounding box gives NaN, and so does a world position whose
   pixel falls outside it.
 - **JWST.** JWST products are FITS files with the GWCS in an `ASDF` extension: not read yet.

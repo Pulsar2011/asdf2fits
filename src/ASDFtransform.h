@@ -46,7 +46,8 @@ namespace DSL
      * @endcode
      *
      * A transform can have an inverse. The file can give one, under the key "inverse" of the transform: Read() then
-     * attaches it, and it comes first. Otherwise Inverse() asks the transform for its own (AnalyticInverse()),
+     * attaches it, and it comes first (unless its numbers of inputs and outputs don't fit, as some astropy writes and
+     * never uses: it is then ignored). Otherwise Inverse() asks the transform for its own (AnalyticInverse()),
      * which a derived class gives when it has one: a shift gives the opposite shift, a composition the composition
      * of the inverses in reverse order. Without either, Inverse() is null and the caller has to invert numerically.
      *

@@ -955,11 +955,14 @@ namespace DSL
         if(const ASDFnode* name = node.Find("name"); name && name->IsString())
             made->fname = name->Get<std::string>();
 
+        // An inverse whose sizes don't fit is ignored, not an error: astropy writes some that it never evaluates,
+        // such as identity(2) for the mapping (0, 1, 0, 1) in the JWST MIRI imager, inside a compose that has
+        // its own inverse. The analytic inverse, or Newton's method in ASDFgwcs, is used instead.
         if(const ASDFnode* inverse = node.Find("inverse"); inverse && !inverse->IsNull())
         {
-            made->finverse = Read(*inverse);
-            if(made->finverse->Inputs() != made->foutputs || made->finverse->Outputs() != made->finputs)
-                Fail("Read", "the inverse of '"+kind+"' doesn't take its outputs back to its inputs");
+            std::shared_ptr<const ASDFtransform> back = Read(*inverse);
+            if(back->Inputs() == made->foutputs && back->Outputs() == made->finputs)
+                made->finverse = std::move(back);
         }
         return made;
     }

@@ -14,6 +14,7 @@
 #include <iostream>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <locale>
 #include <memory>
@@ -2236,8 +2237,12 @@ namespace
         return vertices;
     }
 
-    // Largest distance between the vertices of an S_REGION and the nearest corner of the bounding box, whether
-    // the pipeline took the corners at the edges of the pixels or at their centres
+    // Largest distance between the vertices of an S_REGION and the nearest corner of the bounding box, for the
+    // pipeline's way of taking the corners that fits best:
+    //  - the edges of the box, as gwcs footprint();
+    //  - the centres of the corner pixels;
+    //  - the edges rounded to whole pixels, floor(edge + 0.5), as gwcs footprint(center=True) used by older
+    //    romancal: (-0.5, 4087.5) gives (0, 4088), half a pixel off the two others on each axis.
     double sRegionError(const ASDFgwcs& gwcs, const std::string& sRegion)
     {
         const double inf = std::numeric_limits<double>::infinity();
@@ -2246,13 +2251,21 @@ namespace
         if(vertices.size() != 4 || box.size() != 2)
             return inf;
 
+        using Edges = std::function<std::pair<double,double>(const std::pair<double,double>&)>;
+        const Edges conventions[] = {
+            [](const std::pair<double,double>& e) { return e; },
+            [](const std::pair<double,double>& e) { return std::make_pair(e.first + 0.5, e.second - 0.5); },
+            [](const std::pair<double,double>& e) { return std::make_pair(std::floor(e.first + 0.5), std::floor(e.second + 0.5)); }};
+
         double best = inf;
-        for(double inset : {0., 0.5})
+        for(const Edges& edges : conventions)
         {
+            const auto [x0, x1] = edges(box[0]);
+            const auto [y0, y1] = edges(box[1]);
             std::vector<std::vector<double>> corners;
-            for(double x : {box[0].first + inset, box[0].second - inset})
-                for(double y : {box[1].first + inset, box[1].second - inset})
-                    corners.push_back(gwcs.PixelToWorld({x, y}));
+            for(double x : {x0, x1})
+                for(double y : {y0, y1})
+                    corners.push_back(gwcs.PixelToWorld({x, y}, false));
             double worst = 0.;
             for(const auto& [ra, dec] : vertices)
             {
@@ -2370,8 +2383,11 @@ TEST(ASDFtransform, PolynomialsAndTheInverseGivenByTheFile)
     mapped["domain"] = numberList({0., 10.});
     mapped["window"] = numberList({-1., 1.});
     auto m = ASDFtransform::Read(mapped);
-    EXPECT_DOUBLE_EQ((*m)({5.})[0], 0.);
-    EXPECT_DOUBLE_EQ((*m)({10.})[0], 1.);
+    // Mapped as numpy and astropy do, offset + scale*x: 0.2 isn't exact, so the middle comes out at about
+    // 1e-17, not 0, as in astropy. A relative comparison (EXPECT_DOUBLE_EQ) can't be used next to 0.
+    EXPECT_NEAR((*m)({5.})[0], 0., 1e-15);
+    EXPECT_NEAR((*m)({0.})[0], -1., 1e-15);
+    EXPECT_NEAR((*m)({10.})[0], 1., 1e-15);
 
     // 1 + 2x, with the inverse the file gives: (y - 1) / 2
     ASDFnode line = transformNode("polynomial", "1.2.0");
@@ -2612,11 +2628,13 @@ TEST(Samples, JwstNircamGWCS)
     const std::vector<double> sky = gwcs->Convert("v2v3", "world", {v2, v3});
     EXPECT_LT(skyDistance(sky[0], sky[1], ra, dec), 1e-10) << sky[0] << " " << sky[1];
 
+    // The way back uses the inverse distortion polynomials of the file, fitted to the forward ones: ~0.02 pixel
+    // at the edges, 0 at the centre (gwcs' own test_iter_inv removes them to test an exact round trip)
     for(const std::vector<double>& pixel : std::vector<std::vector<double>>{{0., 0.}, {1023.5, 1023.5}, {2047., 2047.}, {100., 1900.}})
     {
         const std::vector<double> back = gwcs->WorldToPixel(gwcs->PixelToWorld(pixel));
-        EXPECT_NEAR(back[0], pixel[0], 0.01) << pixel[0] << "," << pixel[1];
-        EXPECT_NEAR(back[1], pixel[1], 0.01) << pixel[0] << "," << pixel[1];
+        EXPECT_NEAR(back[0], pixel[0], 0.05) << pixel[0] << "," << pixel[1];
+        EXPECT_NEAR(back[1], pixel[1], 0.05) << pixel[0] << "," << pixel[1];
     }
 }
 
@@ -2625,10 +2643,14 @@ TEST(Samples, JwstMiriGWCS)
     const std::string path = sample("gwcs_miriwcs.asdf");
     SKIP_WITHOUT(path);
     ASDFmanager file(path);
+    // Some inverses inside the file don't fit their transform (identity(2) for the mapping (0, 1, 0, 1)): they
+    // are ignored, the whole step has its own
     auto gwcs = ASDFgwcs::Read(file.GetTree().At("wcs"));
     EXPECT_TRUE(gwcs->OutputFrame().IsCelestial());
+    EXPECT_TRUE(gwcs->HasInverse());
     ASSERT_EQ(gwcs->BoundingBox().size(), 2u);
 
+    // As for NIRCam, the way back uses fitted inverse polynomials
     const auto& box = gwcs->BoundingBox();
     for(double fx : {0.1, 0.5, 0.9})
         for(double fy : {0.1, 0.5, 0.9})
@@ -2638,8 +2660,8 @@ TEST(Samples, JwstMiriGWCS)
             const std::vector<double> world = gwcs->PixelToWorld(pixel);
             ASSERT_TRUE(std::isfinite(world[0]) && std::isfinite(world[1]));
             const std::vector<double> back = gwcs->WorldToPixel(world);
-            EXPECT_NEAR(back[0], pixel[0], 0.01) << pixel[0] << "," << pixel[1];
-            EXPECT_NEAR(back[1], pixel[1], 0.01) << pixel[0] << "," << pixel[1];
+            EXPECT_NEAR(back[0], pixel[0], 0.05) << pixel[0] << "," << pixel[1];
+            EXPECT_NEAR(back[1], pixel[1], 0.05) << pixel[0] << "," << pixel[1];
         }
 }
 
