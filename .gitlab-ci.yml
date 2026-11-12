@@ -13,6 +13,16 @@ stages:
 
 variables:
   SECRET_DETECTION_ENABLED: 'true'
+  GIT_SUBMODULE_STRATEGY: normal
+  DEBIAN_FRONTEND: noninteractive
+  GIT_DEPTH: "0"
+  # Compilers are named explicitly: left to itself, CMake takes /usr/bin/cc and c++, which are GCC 14.
+  # Every job that configures must install clang, and llvm for llvm-ar, used by the link-time
+  # optimisation of the release build. For GCC 14, set CC: gcc and CXX: g++.
+  CC: clang
+  CXX: clang++
+  # Packages of the build, of the DeepSky libraries it needs (deps job) and of its tests
+  BUILD_PACKAGES: "cmake clang llvm libgsl-dev qt6-base-dev gnuplot-nox libcairo2 libpango-1.0-0 libpangocairo-1.0-0"
 
 # Extended by each job rather than set globally: secret_detection has its own image, without apt-get.
 .debian:
@@ -41,15 +51,28 @@ deps:
   variables:
     GIT_SUBMODULE_STRATEGY: none
   script:
-    - mkdir -p deepskyproject
-    - git clone https://oauth2:${DEEPSKYFITS_TOKEN}@gitlab.in2p3.fr/deepskyproject/deepskyfits.git
-    - cd deepskyfits
-    - git submodule update --init --recursive
-    - cmake -DCMAKE_INSTALL_PREFIX=../deepskyproject -Wno-dev -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF .
-    - make -j 2
-    # Configure again: the install rules list headers that only exist after the first build.
-    - cmake -DCMAKE_INSTALL_PREFIX=../deepskyproject -Wno-dev -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF .
-    - make -j 2 install
+    - |
+      set -e
+      export DeepSkyROOT=$(pwd)/deepskyproject
+      mkdir -p "$DeepSkyROOT"
+      # Builds and installs one DeepSky library into DeepSkyROOT: out of source with the CMake
+      # presets when the repository has them, with its former in-source commands otherwise.
+      install_deepsky() {
+        git clone --recurse-submodules "https://oauth2:${DEEPSKYFITS_TOKEN}@gitlab.in2p3.fr/deepskyproject/$1.git"
+        cd "$1"
+        if [ -f CMakePresets.json ]; then
+          cmake --preset default -DCMAKE_INSTALL_PREFIX="$DeepSkyROOT" -DBUILD_TESTS=OFF
+          cmake --build build --parallel 2 --target install
+        else
+          cmake -DCMAKE_INSTALL_PREFIX="$DeepSkyROOT" -Wno-dev .
+          make -j 2
+          # The former deepskyfits CMakeLists needs a second configure to list the submodule headers
+          cmake -DCMAKE_INSTALL_PREFIX="$DeepSkyROOT" -Wno-dev .
+          make -j 2 install
+        fi
+        cd ..
+      }
+      install_deepsky deepskyfits
   artifacts:
     expire_in: 24 hrs
     paths:
