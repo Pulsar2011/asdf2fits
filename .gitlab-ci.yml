@@ -17,20 +17,22 @@ variables:
 # Extended by each job rather than set globally: secret_detection has its own image, without apt-get.
 .debian:
   image:
-    name: gcc:13-bookworm
+    name: buildpack-deps:trixie
   variables:
     DEBIAN_FRONTEND: noninteractive
     GIT_SUBMODULE_STRATEGY: normal
     # libfyaml takes its version from the git tags of its submodule, which a shallow clone doesn't have.
     GIT_DEPTH: "0"
+    CC: clang
+    CXX: clang++
   before_script:
     - apt-get update
-    - apt-get install -y cmake make git patch
+    - apt-get install -y cmake make git patch clang llvm gdb
     - apt-get install -y build-essential pkg-config autoconf automake libtool ca-certificates
     # DeepSkyFits
     - apt-get install -y libgsl-dev
     # libasdf
-    - apt-get install -y liblz4-dev zlib1g-dev libbz2-dev
+    - apt-get install -y liblz4-dev zlib1g-dev libbz2-dev 
 
 # DEEPSKYFITS_TOKEN: CI/CD variable of this project or its group, with read access to deepskyfits.
 deps:
