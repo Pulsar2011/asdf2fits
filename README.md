@@ -1,4 +1,6 @@
-![Project logo](asdf2fitsLogo.png)
+<p align="center">
+  <img src="asdf2fitsLogo.png" alt="Description" width="400">
+</p>
 
 # asdf2fits
 
