@@ -279,3 +279,5 @@ This licence covers the code of asdf2fits only:
 
 - asdf2fits requires [DeepSkyFits](https://gitlab.in2p3.fr/deepskyproject/deepskyfits), which has its own licence, the PolyForm Noncommercial License 1.0.0. That licence still applies to DeepSkyFits when it is used with asdf2fits.
 - The submodules libasdf, libfyaml, libmd and GoogleTest keep their own licences, found in each one's `LICENSE` or `COPYING` file. The libasdf patches in [cmake/patches](cmake/patches) are under libasdf's licence.
+
+*Logo concept and artwork generated with assistance from Gemini, based on the DeepSkyProject visual identity.*
