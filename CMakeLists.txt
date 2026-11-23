@@ -15,7 +15,7 @@ if(_src STREQUAL _bin)
         "or from a build directory: mkdir build && cd build && cmake .. && make")
 endif()
 
-project(asdf2fits VERSION 0.1.0 LANGUAGES C CXX)
+project(asdf2fits VERSION 0.2.0 LANGUAGES C CXX)
 
 if(NOT WIN32)
     string(ASCII 27 Esc)

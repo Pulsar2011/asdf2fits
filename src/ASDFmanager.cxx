@@ -508,6 +508,18 @@ namespace DSL
         return std::make_shared<FITShdu>(impl->at(index, "GetHeaderAtIndex").header);
     }
 
+    ASDFhduPath ASDFmanager::GetPathAtIndex(const int& index)
+    {
+        std::lock_guard<std::mutex> lk(impl->mtx);
+        const HDUEntry& entry = impl->at(index, "GetPathAtIndex");
+
+        ASDFhduPath where;
+        // Only the entries of the astropy FITS layout have a card list; keywordsPath is empty without keywords
+        where.node = entry.cardsPath.empty() ? entry.keywordsPath : entry.parentPath;
+        where.data = entry.dataPath;
+        return where;
+    }
+
     std::shared_ptr<FITShdu> ASDFmanager::GetHeader(const std::string& name)
     {
         std::lock_guard<std::mutex> lk(impl->mtx);

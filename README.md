@@ -1,3 +1,5 @@
+![Project logo](asdf2fitsLogo.png)
+
 # asdf2fits
 
 Load [ASDF](https://www.asdf-format.org/) files as [DeepSkyFits](https://gitlab.in2p3.fr/deepskyproject/deepskyfits)
@@ -98,7 +100,9 @@ std::dynamic_pointer_cast<ASDFcube>(cut)->WriteASDF("cut.asdf", options);
 
 - **Tree.** `ASDFnode` holds every value of the tree with its tag, mappings in file order. Paths join keys and
   indices with `/`. `ASDFmanager::GetTree()` returns the whole tree without reading any array, and
-  `WriteASDF(tree, path)` writes one, for example after changing only metadata.
+  `WriteASDF(tree, path)` writes one, for example after changing only metadata. `ASDFmanager::GetPathAtIndex()`
+  tells where an HDU is in that tree: the subtree it is read from (`roman`, or `fits/0` in the astropy FITS layout)
+  and its data (`roman/data`).
 - **Header.** The header of an image is built from the tree as before (`META.INSTRUMENT.NAME`). A keyword changed
   in the header updates the value it was read from, keeping its tag; a removed one removes it; a new one goes
   next to the image, a dotted name `A.B` as the mappings `a/b`. The structure keywords (`BITPIX`, `NAXISn`,

@@ -17,6 +17,7 @@
 #include <functional>
 #include <limits>
 #include <locale>
+#include <map>
 #include <memory>
 #include <numbers>
 #include <sstream>
@@ -1535,6 +1536,100 @@ TEST(ASDFimage, AsdfLikeGivesAResultTheTree)
     EXPECT_EQ(tree.At("roman/meta/exposure/start_time").Tag(), "tag:stsci.edu:asdf/time/time-1.4.0");
     EXPECT_NE(tree.FindPath("roman/amp33"), nullptr);
     EXPECT_EQ(tree.FindPath("roman/err"), nullptr);
+}
+
+TEST(ASDFmanager, PathAtIndex)
+{
+    // Any tree: the subtree is the mapping whose values are the keywords; none for data at the root
+    {
+        TempFile out(".asdf");
+        ASDFnode tree;
+        tree["sci"]["meta"]["telescope"] = "X";
+        tree["sci"]["data"] = ASDFnode(ASDFarray::FromCube(ramp<float>({6, 4})));
+        tree["sci"]["dq"] = ASDFnode(ASDFarray::FromCube(ramp<uint16_t>({6, 4})));
+        tree["flat"] = ASDFnode(ASDFarray::FromCube(ramp<float>({6, 4})));
+        WriteASDF(tree, out.path());
+
+        ASDFmanager file(out.path());
+        ASSERT_EQ(file.NumberOfHeader(), 3);
+        const ASDFnode back = file.GetTree();
+        const std::map<std::string, ASDFhduPath> expected = {
+            {"sci.data", {"sci", "sci/data"}},
+            {"sci.dq",   {"sci", "sci/dq"}},
+            {"flat",     {"",    "flat"}},
+        };
+        for(int i = 1; i <= file.NumberOfHeader(); i++)
+        {
+            const std::string name = file.GetHeaderAtIndex(i)->GetValueForKey("EXTNAME");
+            ASSERT_EQ(expected.count(name), 1u) << name;
+            const ASDFhduPath where = file.GetPathAtIndex(i);
+            EXPECT_EQ(where.node, expected.at(name).node) << name;
+            EXPECT_EQ(where.data, expected.at(name).data) << name;
+            const ASDFnode* data = back.FindPath(where.data);
+            ASSERT_NE(data, nullptr) << name;
+            EXPECT_TRUE(data->IsArray()) << name;
+        }
+
+        EXPECT_THROW(file.GetPathAtIndex(0), FITSexception);
+        EXPECT_THROW(file.GetPathAtIndex(4), FITSexception);
+        file.Close();
+        EXPECT_THROW(file.GetPathAtIndex(1), FITSexception);
+    }
+
+    // Roman data model: every array of roman/ comes from the roman mapping
+    {
+        TempFile out(".asdf");
+        writeRoman(out.path());
+        ASDFmanager file(out.path());
+        int found = 0;
+        for(int i = 1; i <= file.NumberOfHeader(); i++)
+        {
+            const std::shared_ptr<FITShdu> header = file.GetHeaderAtIndex(i);
+            const std::string name = header->Exists("EXTNAME") ? header->GetValueForKey("EXTNAME") : std::string();
+            if(name == "roman.data" || name == "roman.dq")
+            {
+                const ASDFhduPath where = file.GetPathAtIndex(i);
+                EXPECT_EQ(where.node, "roman") << name;
+                EXPECT_EQ(where.data, name == "roman.data" ? "roman/data" : "roman/dq");
+                found++;
+            }
+        }
+        EXPECT_EQ(found, 2);
+    }
+
+    // Astropy FITS layout: the subtree is the entry of the list, with its header and its data
+    {
+        TempFile out(".asdf");
+        auto table = std::make_shared<FITStable>("CAT");
+        table->InsertColumn(column<int32_t>("ID", tint, {1, 2, 3}));
+        fits2asdf(*table, out.path());
+
+        ASDFmanager file(out.path());
+        ASSERT_EQ(file.NumberOfHeader(), 2);
+        const ASDFnode back = file.GetTree();
+        for(int i = 1; i <= 2; i++)
+        {
+            const ASDFhduPath where = file.GetPathAtIndex(i);
+            EXPECT_EQ(where.node, ASDFnode::ParentPath(where.data));
+            EXPECT_EQ(where.data.substr(where.data.rfind('/') + 1), "data") << where.data;
+            EXPECT_NE(back.FindPath(ASDFnode::ChildPath(where.node, "header")), nullptr) << where.node;
+        }
+        EXPECT_NE(back.FindPath(file.GetPathAtIndex(2).data), nullptr);
+    }
+
+    // A tree without data: the PRIMARY HDU made for it has no place in the tree
+    {
+        TempFile out(".asdf");
+        ASDFnode tree;
+        tree["meta"]["object"] = "M31";
+        WriteASDF(tree, out.path());
+
+        ASDFmanager file(out.path());
+        ASSERT_EQ(file.NumberOfHeader(), 1);
+        const ASDFhduPath where = file.GetPathAtIndex(1);
+        EXPECT_TRUE(where.node.empty());
+        EXPECT_TRUE(where.data.empty());
+    }
 }
 
 TEST(ASDFmanager, GetImageWindowReadsOnlyTheWindow)

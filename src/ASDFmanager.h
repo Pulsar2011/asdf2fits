@@ -40,6 +40,19 @@ namespace DSL
         std::string tmpDir;     //!< Directory of those temporary files; empty for the system's
     };
 
+    /** @brief Where an HDU of an ASDF file is in the tree of the file; see ASDFmanager::GetPathAtIndex(). */
+    struct ASDFhduPath
+    {
+        /**
+         * @brief Path of the subtree the HDU is read from.
+         * @details In the astropy FITS layout, its entry of the list, as "fits/0"; in any other tree, the mapping
+         * whose values are its keywords, as "roman". Empty when no subtree is its own: data directly under the
+         * root, or the PRIMARY HDU made for a tree without data.
+         */
+        std::string node;
+        std::string data;   //!< Path of its data value, as "roman/data" or "fits/0/data"; empty for the PRIMARY HDU made for a tree without data
+    };
+
     /**
      * @class DSL::ASDFmanager ASDFmanager.h "asdf2fits/ASDFmanager.h"
      * @brief Opens an ASDF file and hands out its content as DeepSkyFits objects.
@@ -141,6 +154,15 @@ namespace DSL
          * @throws FITSexception FILE_NOT_OPENED if the file is closed, BAD_HDU_NUM if there is no such HDU.
          */
         std::shared_ptr<FITShdu>   GetHeaderAtIndex(const int& index);
+
+        /**
+         * @brief Get where an HDU is in the tree of the file (see GetTree()).
+         * @details The paths are those of ASDFnode, so that GetTree().FindPath() finds the nodes they name.
+         * @param index Index of the HDU, starting at 1.
+         * @return The paths of the subtree the HDU is read from and of its data.
+         * @throws FITSexception FILE_NOT_OPENED if the file is closed, BAD_HDU_NUM if there is no such HDU.
+         */
+        ASDFhduPath                GetPathAtIndex(const int& index);
 
         /**
          * @brief Get a copy of the header of an HDU.
