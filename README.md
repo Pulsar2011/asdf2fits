@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="asdf2fitsLogo.png" alt="Description" width="400">
+  <img src="asdf2fitsLogo.png" alt="Description" width="200">
 </p>
 
 # asdf2fits
